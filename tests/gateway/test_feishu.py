@@ -3969,6 +3969,42 @@ class TestProcessingReactions(unittest.TestCase):
             self._run(adapter.on_processing_start(self._event()))
         self.assertEqual(tracker.create_calls, ["Typing"])
 
+    @patch.dict(
+        os.environ,
+        {"FEISHU_PROCESSING_START_REPLY": "[敲键盘]", "FEISHU_REACTIONS": "false"},
+        clear=True,
+    )
+    def test_start_reply_sends_thread_reply_when_configured(self):
+        adapter, tracker = self._build_adapter(next_reaction_id="r_typing")
+        captured = {"reply_calls": 0}
+
+        def _reply(request):
+            captured["reply_calls"] += 1
+            captured["request"] = request
+            return SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_ack"),
+            )
+
+        adapter._client.im.v1.message = SimpleNamespace(reply=_reply)
+        event = SimpleNamespace(
+            message_id="om_trigger",
+            source=SimpleNamespace(chat_id="oc_chat", thread_id="omt_topic"),
+        )
+
+        with self._patch_to_thread():
+            self._run(adapter.on_processing_start(event))
+            self._run(adapter.on_processing_start(event))
+
+        self.assertEqual(tracker.create_calls, [])
+        self.assertEqual(captured["reply_calls"], 1)
+        request = captured["request"]
+        self.assertEqual(request.message_id, "om_trigger")
+        self.assertTrue(request.request_body.reply_in_thread)
+        payload = json.loads(request.request_body.content)
+        self.assertEqual(payload["text"], "[敲键盘]")
+        self.assertIn("om_trigger", adapter._processing_start_reply_sent)
+
     @patch.dict(os.environ, {}, clear=True)
     def test_start_does_not_cache_when_create_fails(self):
         adapter, tracker = self._build_adapter(create_success=False)

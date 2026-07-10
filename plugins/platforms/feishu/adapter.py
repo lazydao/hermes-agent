@@ -251,6 +251,7 @@ _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withd
 # the success signal.
 _FEISHU_REACTION_IN_PROGRESS = "Typing"
 _FEISHU_REACTION_FAILURE = "CrossMark"
+_FEISHU_PROCESSING_START_REPLY_ENV = "FEISHU_PROCESSING_START_REPLY"
 # Bound on the (message_id → reaction_id) handle cache. Happy-path entries
 # drain on completion; the cap is a safeguard against unbounded growth from
 # delete-failures, not a capacity plan.
@@ -1537,6 +1538,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        self._processing_start_reply_sent: "OrderedDict[str, None]" = OrderedDict()
         self._load_seen_message_ids()
 
     @staticmethod
@@ -3184,7 +3186,43 @@ class FeishuAdapter(BasePlatformAdapter):
     def _pop_processing_reaction(self, message_id: str) -> Optional[str]:
         return self._pending_processing_reactions.pop(message_id, None)
 
+    @staticmethod
+    def _processing_start_reply_text() -> str:
+        value = os.getenv(_FEISHU_PROCESSING_START_REPLY_ENV, "").strip()
+        return "" if value.lower() in {"false", "0", "no"} else value
+
+    def _remember_processing_start_reply(self, message_id: str) -> None:
+        cache = self._processing_start_reply_sent
+        cache[message_id] = None
+        cache.move_to_end(message_id)
+        while len(cache) > _FEISHU_PROCESSING_REACTION_CACHE_SIZE:
+            cache.popitem(last=False)
+
+    async def _send_processing_start_reply(self, event: MessageEvent) -> None:
+        text = self._processing_start_reply_text()
+        if not text:
+            return
+        message_id = event.message_id
+        source = getattr(event, "source", None)
+        chat_id = getattr(source, "chat_id", "") if source else ""
+        if not message_id or not chat_id or message_id in self._processing_start_reply_sent:
+            return
+
+        metadata: Optional[Dict[str, Any]] = None
+        thread_id = getattr(source, "thread_id", None) if source else None
+        if thread_id:
+            metadata = {"thread_id": thread_id, "reply_to_message_id": message_id}
+        result = await self.send(
+            chat_id=chat_id,
+            content=text,
+            reply_to=message_id,
+            metadata=metadata,
+        )
+        if result.success:
+            self._remember_processing_start_reply(message_id)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
+        await self._send_processing_start_reply(event)
         if not self._reactions_enabled():
             return
         message_id = event.message_id
