@@ -42,7 +42,3 @@ optional_env:
     description: "Display name for the Feishu home channel"
     prompt: "Home channel display name"
     password: false
-  - name: FEISHU_PROCESSING_START_REPLY
-    description: "Optional text reply sent to the triggering Feishu message when Hermes starts processing it; empty disables"
-    prompt: "Processing start reply text"
-    password: false
