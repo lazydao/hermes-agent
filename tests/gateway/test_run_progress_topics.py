@@ -314,6 +314,23 @@ class DuplicateNativeToolsAgent:
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
+class PlatformMessageCaptureAgent:
+    captured_platform_message_id = None
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).captured_platform_message_id = getattr(
+            self, "_next_platform_message_id", None
+        )
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class ThinkingAgent:
     """Agent that emits _thinking scratch text (no tool calls).
 
@@ -538,6 +555,52 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
     }
     assert adapter.sent[0]["metadata"] == expected_metadata
     assert all(call["metadata"] == expected_metadata for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_persists_actual_platform_message_not_reply_anchor(
+    monkeypatch, tmp_path
+):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = PlatformMessageCaptureAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    PlatformMessageCaptureAgent.captured_platform_message_id = None
+
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="channel-1",
+        chat_type="thread",
+        thread_id="thread-1",
+    )
+    await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-platform-id",
+        session_key="agent:main:discord:thread:thread-1",
+        event_message_id="thread-root-message",
+        platform_message_id="actual-inbound-message",
+    )
+
+    assert (
+        PlatformMessageCaptureAgent.captured_platform_message_id
+        == "actual-inbound-message"
+    )
 
 
 @pytest.mark.asyncio
