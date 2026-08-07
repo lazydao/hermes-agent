@@ -87,8 +87,9 @@ conservative at the waist.
   against a temp `HERMES_HOME`. Mocks hide integration bugs.
 - **Cache-, alternation-, and invariant-safe.** Preserve prompt caching, strict
   message role alternation (never two same-role messages in a row; never a
-  synthetic user message injected mid-loop), and a system prompt that is
-  byte-stable for the life of a conversation.
+  synthetic user message injected mid-loop except the bounded verification and
+  response-guard nudges described under "Prompt Caching Must Not Break"), and a
+  system prompt that is byte-stable for the life of a conversation.
 - **Contributor credit preserved.** Salvage external work by cherry-picking
   (rebase-merge) so authorship survives in git history; don't reimplement from
   scratch when you can build on top.
@@ -1342,6 +1343,40 @@ locks by widening the tree-kill.
 
 ## Important Policies
 
+### Core Changes and Live Gateway Restarts Require Explicit Approval
+
+- Treat edits to Hermes core code and restarts of any live profile gateway as
+  separate high-impact actions. Before either action, report the exact scope,
+  user-visible impact, verification plan, and rollback plan, then obtain
+  explicit user approval for that action. A generic approval for the
+  surrounding automation or incident work does not authorize core edits or
+  gateway restarts.
+- Prefer profile configuration, plugins, hooks, wrappers, or project-side
+  coordination before changing Hermes core. If a core change is still needed,
+  explain why those narrower extension points are insufficient before asking
+  for approval.
+- Immediately before restarting, re-check `active_agents` for every target
+  profile. Do not restart a profile with active work unless the user explicitly
+  authorizes interrupting that work; restart only the approved profiles and
+  verify both the new process identity and Feishu connection state afterward.
+
+### Fork Upstream Sync Policy
+
+This checkout is maintained through the `lazydao/hermes-agent` fork. Normal
+upstream synchronization is gated by upstream release tags:
+
+- Fetching or inspecting `upstream/main` is allowed, but do not merge, rebase,
+  or cherry-pick it into `h3/main` merely because upstream main has advanced.
+- Start an upstream synchronization only after `NousResearch/hermes-agent`
+  publishes a release tag newer than the last evaluated release tag.
+- Build a candidate branch from that release tag, reconcile the fork's local
+  changes there, and validate all three Hermes profiles before promoting it to
+  `h3/main` or restarting the live gateways.
+- Selectively backport an untagged upstream fix only for a confirmed critical
+  security or production issue and only after explicit user approval.
+- The current evaluated release baseline is `v2026.8.3`; update this baseline
+  as part of each completed upstream synchronization.
+
 ### Prompt Caching Must Not Break
 
 Hermes-Agent ensures caching remains valid throughout a conversation. **Do NOT implement changes that would:**
@@ -1350,6 +1385,12 @@ Hermes-Agent ensures caching remains valid throughout a conversation. **Do NOT i
 - Reload memories or rebuild system prompts mid-conversation
 
 Cache-breaking forces dramatically higher costs. The ONLY time we alter context is during context compression.
+
+Bounded `pre_verify` and `pre_response` gates are the narrow tail-append
+exception: they may append one alternating assistant + synthetic-user pair to
+request another model response, up to their configured nudge limit. They must
+never mutate the existing cached prefix, persist that synthetic scaffolding to
+the durable transcript, or continue after the bound is exhausted.
 
 Slash commands that mutate system-prompt state (skills, tools, memory, etc.)
 must be **cache-aware**: default to deferred invalidation (change takes
