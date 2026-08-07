@@ -343,6 +343,51 @@ class TestGeneratedSystemdUnits:
 
         assert "SoftResourceLimits" not in plist
 
+    def test_user_unit_includes_wsl_windows_interop_paths(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: True)
+        monkeypatch.setenv(
+            "PATH",
+            "/usr/local/bin:/mnt/c/WINDOWS/system32:/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/",
+        )
+
+        def fake_which(cmd):
+            if cmd == "powershell.exe":
+                return "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe"
+            return None
+
+        monkeypatch.setattr(gateway_cli.shutil, "which", fake_which)
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+        path_line = next(line for line in unit.splitlines() if line.startswith('Environment="PATH='))
+
+        assert "/mnt/c/WINDOWS/system32" in unit
+        assert "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0" in unit
+        assert "/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/" not in path_line
+        assert path_line.count("/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0") == 1
+
+    def test_user_unit_omits_windows_interop_paths_outside_wsl(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
+        monkeypatch.setenv("PATH", "/usr/local/bin:/mnt/c/WINDOWS/system32")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: None)
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        assert "/mnt/c/WINDOWS/system32" not in unit
+
+    def test_system_unit_includes_wsl_windows_interop_paths(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: True)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+        )
+        monkeypatch.setattr(gateway_cli, "_hermes_home_for_target_user", lambda home: "/home/alice/.hermes")
+        monkeypatch.setenv("PATH", "/usr/local/bin:/mnt/c/WINDOWS/system32")
+        monkeypatch.setattr(gateway_cli.shutil, "which", lambda cmd: None)
+
+        unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
+
+        assert "/mnt/c/WINDOWS/system32" in unit
 
 
 class TestGatewayStopCleanup:
