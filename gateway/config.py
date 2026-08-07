@@ -857,6 +857,43 @@ class StreamingConfig:
         )
 
 
+@dataclass
+class GatewayRequestLockConfig:
+    """Optional shared lock used to coordinate agent requests with maintenance."""
+
+    path: Optional[Path] = None
+    wait_timeout_seconds: Optional[float] = None
+    poll_interval_seconds: float = 0.1
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "path": str(self.path) if self.path is not None else None,
+            "wait_timeout_seconds": self.wait_timeout_seconds,
+            "poll_interval_seconds": self.poll_interval_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GatewayRequestLockConfig":
+        data = _coerce_dict(data)
+        raw_path = data.get("path")
+        path = None
+        if isinstance(raw_path, str) and raw_path.strip():
+            path = Path(raw_path.strip()).expanduser()
+
+        timeout = _coerce_float(data.get("wait_timeout_seconds"), 0.0)
+        if timeout <= 0:
+            timeout = None
+
+        poll_interval = _coerce_float(data.get("poll_interval_seconds"), 0.1)
+        poll_interval = min(max(poll_interval, 0.01), 5.0)
+
+        return cls(
+            path=path,
+            wait_timeout_seconds=timeout,
+            poll_interval_seconds=poll_interval,
+        )
+
+
 # -----------------------------------------------------------------------------
 # Built-in platform connection checkers
 # -----------------------------------------------------------------------------
@@ -973,6 +1010,13 @@ class GatewayConfig:
     # Optional named-profile allowlist for multiplex mode. None preserves the
     # historical serve-all behavior; [] serves only the default profile.
     multiplex_profile_allowlist: Optional[List[str]] = None
+
+    # Optional cross-process coordination lock held in shared mode for the
+    # complete lifetime of each agent request. A maintenance process can take
+    # the same file in exclusive mode to prevent repository-wide overlap.
+    request_lock: GatewayRequestLockConfig = field(
+        default_factory=GatewayRequestLockConfig
+    )
 
     # Opt-in systemd event-loop watchdog. Zero preserves Type=simple and
     # disables sd_notify at runtime.
@@ -1122,6 +1166,7 @@ class GatewayConfig:
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
             "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
+            "request_lock": self.request_lock.to_dict(),
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
@@ -1193,6 +1238,9 @@ class GatewayConfig:
             multiplex_profile_allowlist = nested_gateway.get(
                 "multiplex_profile_allowlist"
             )
+        request_lock_data = data.get("request_lock")
+        if not isinstance(request_lock_data, dict):
+            request_lock_data = nested_gateway.get("request_lock", {})
         if "systemd_watchdog_seconds" in data:
             systemd_watchdog_raw = data.get("systemd_watchdog_seconds")
             systemd_watchdog_key = "systemd_watchdog_seconds"
@@ -1267,6 +1315,7 @@ class GatewayConfig:
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
             multiplex_profile_allowlist=multiplex_profile_allowlist,
+            request_lock=GatewayRequestLockConfig.from_dict(request_lock_data),
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
             max_concurrent_sessions=max_concurrent_sessions,
@@ -1441,6 +1490,8 @@ def load_gateway_config() -> GatewayConfig:
                     gw_data["systemd_watchdog_seconds"] = gateway_section[
                         "systemd_watchdog_seconds"
                     ]
+                if "request_lock" in gateway_section:
+                    gw_data["request_lock"] = gateway_section["request_lock"]
 
             if "max_concurrent_sessions" in yaml_cfg:
                 gw_data["max_concurrent_sessions"] = yaml_cfg["max_concurrent_sessions"]
