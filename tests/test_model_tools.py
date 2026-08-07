@@ -30,6 +30,19 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    def test_request_budget_is_runtime_metadata_not_model_tool_args(self):
+        budget = object()
+        with patch("model_tools.registry.dispatch", return_value='{"ok":true}') as dispatch:
+            result = handle_function_call(
+                "terminal",
+                {"command": "echo hi"},
+                request_chain_budget=budget,
+            )
+
+        assert result == '{"ok":true}'
+        assert dispatch.call_args.args[1] == {"command": "echo hi"}
+        assert dispatch.call_args.kwargs["request_chain_budget"] is budget
+
 
 
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):

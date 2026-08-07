@@ -196,6 +196,25 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
 
+def test_shared_request_budget_reports_cumulative_usage(monkeypatch):
+    """A continuation starting at zero remaining reports 90/90, not 0/90."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(max_iterations=90, budget_remaining=0)
+    agent.iteration_budget.used = 90
+    agent.iteration_budget.max_total = 90
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+        api_call_count=0,
+    )
+
+    assert result["final_response"] == "summary from extra call"
+    assert result["turn_exit_reason"] == "max_iterations_reached(90/90)"
+    assert result["completed"] is False
+
+
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
     """When budget exhaustion preserves a verification candidate that is
     already the tail assistant message, the finalizer must NOT append a
@@ -233,7 +252,6 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     assert agent.persisted_messages is not None
     persisted_roles = [m["role"] for m in agent.persisted_messages]
     assert persisted_roles == ["user", "assistant"]
-
 
 def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     """When budget is exhausted and the turn was interrupted,
@@ -371,5 +389,3 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
     )
 
     record.assert_not_called()
-
-

@@ -1046,12 +1046,14 @@ class QueuedIterationLimitAgent:
     """First turn hits its cap; the queued event completes the same task."""
 
     calls = 0
+    budgets = []
 
     def __init__(self, **kwargs):
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
         type(self).calls += 1
+        type(self).budgets.append(getattr(self, "_next_iteration_budget", None))
         if type(self).calls == 1:
             return {
                 "final_response": "stage result",
@@ -1250,6 +1252,7 @@ async def test_run_agent_defers_iteration_limit_reply_for_internal_followup(
     monkeypatch, tmp_path,
 ):
     QueuedIterationLimitAgent.calls = 0
+    QueuedIterationLimitAgent.budgets = []
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1261,6 +1264,8 @@ async def test_run_agent_defers_iteration_limit_reply_for_internal_followup(
 
     sent_texts = [call["content"] for call in adapter.sent]
     assert QueuedIterationLimitAgent.calls == 2
+    assert len(QueuedIterationLimitAgent.budgets) == 2
+    assert QueuedIterationLimitAgent.budgets[1] is QueuedIterationLimitAgent.budgets[0]
     assert result["final_response"] == "final result"
     assert "stage result" not in sent_texts
 
@@ -1270,6 +1275,7 @@ async def test_run_agent_keeps_iteration_limit_reply_before_user_followup(
     monkeypatch, tmp_path,
 ):
     QueuedIterationLimitAgent.calls = 0
+    QueuedIterationLimitAgent.budgets = []
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1281,6 +1287,8 @@ async def test_run_agent_keeps_iteration_limit_reply_before_user_followup(
 
     sent_texts = [call["content"] for call in adapter.sent]
     assert QueuedIterationLimitAgent.calls == 2
+    assert len(QueuedIterationLimitAgent.budgets) == 2
+    assert QueuedIterationLimitAgent.budgets[1] is not QueuedIterationLimitAgent.budgets[0]
     assert result["final_response"] == "final result"
     assert "stage result" in sent_texts
 
