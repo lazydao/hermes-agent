@@ -3,7 +3,9 @@
 Extracted from ``run_agent.py``.  Each ``AIAgent`` instance (parent or
 subagent) holds an :class:`IterationBudget`; the parent's cap comes from
 ``max_iterations`` (default 500), each subagent's cap comes from
-``delegation.max_iterations`` (default 50).
+``delegation.max_iterations`` (default 50). Gateway-internal continuation
+turns for one user request may share the same parent budget object so
+synthetic follow-ups cannot silently reset the request's cap.
 
 ``run_agent`` re-exports ``IterationBudget`` so existing
 ``from run_agent import IterationBudget`` imports keep working unchanged.
@@ -14,11 +16,16 @@ from __future__ import annotations
 import threading
 
 
+REQUEST_CHAIN_BUDGET_EVENT_KEY = "_request_chain_iteration_budget"
+
+
 class IterationBudget:
     """Thread-safe iteration counter for an agent.
 
-    Each agent (parent or subagent) gets its own ``IterationBudget``.
-    The parent's budget is capped at ``max_iterations`` (default 500).
+    Each agent (parent or subagent) gets its own ``IterationBudget`` by default.
+    The gateway may reuse a parent's instance across internal continuation
+    turns that belong to one external user request. The parent's budget is
+    capped at ``max_iterations`` (default 500).
     Each subagent gets an independent budget capped at
     ``delegation.max_iterations`` (default 50) — this means total
     iterations across parent + subagents can exceed the parent's cap.
@@ -59,4 +66,4 @@ class IterationBudget:
             return max(0, self.max_total - self._used)
 
 
-__all__ = ["IterationBudget"]
+__all__ = ["IterationBudget", "REQUEST_CHAIN_BUDGET_EVENT_KEY"]

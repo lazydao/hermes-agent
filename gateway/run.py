@@ -60,6 +60,7 @@ from agent.conversation_compression import (
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
+from agent.iteration_budget import IterationBudget, REQUEST_CHAIN_BUDGET_EVENT_KEY
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -2727,6 +2728,36 @@ def _should_defer_internal_iteration_limit_response(
     return exit_reason.startswith("max_iterations_reached(")
 
 
+def _request_chain_budget_from_event(
+    event: MessageEvent | None,
+) -> IterationBudget | None:
+    """Return the originating request budget carried by an internal event."""
+    if event is None or not bool(getattr(event, "internal", False)):
+        return None
+    metadata = getattr(event, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    budget = metadata.get(REQUEST_CHAIN_BUDGET_EVENT_KEY)
+    return budget if isinstance(budget, IterationBudget) else None
+
+
+def _request_chain_budget_for_followup(
+    current_budget: IterationBudget,
+    pending_event: MessageEvent | None,
+    *,
+    leftover_steer: bool = False,
+) -> IterationBudget | None:
+    """Choose whether a recursively drained turn continues the same request."""
+    event_budget = _request_chain_budget_from_event(pending_event)
+    if event_budget is not None:
+        return event_budget
+    if pending_event is not None and bool(getattr(pending_event, "internal", False)):
+        return current_budget
+    if pending_event is None and leftover_steer:
+        return current_budget
+    return None
+
+
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
@@ -4337,6 +4368,8 @@ class TurnRunner:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
 
         max_iterations = _current_max_iterations()
+        if ctx.request_chain_budget is None:
+            ctx.request_chain_budget = IterationBudget(max_iterations)
 
         try:
             model, runtime_kwargs = self._runner._resolve_session_agent_runtime(
@@ -5328,6 +5361,7 @@ class TurnRunner:
                 agent._next_platform_message_id = str(
                     persisted_platform_message_id
                 )
+            agent._next_iteration_budget = ctx.request_chain_budget
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
@@ -5336,7 +5370,11 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            try:
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            finally:
+                if getattr(agent, "_next_iteration_budget", None) is ctx.request_chain_budget:
+                    agent._next_iteration_budget = None
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -17468,6 +17506,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                _request_chain_budget=_request_chain_budget_from_event(event),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -21822,6 +21861,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            request_chain_budget = evt.get(REQUEST_CHAIN_BUDGET_EVENT_KEY)
+            if isinstance(request_chain_budget, IterationBudget):
+                metadata[REQUEST_CHAIN_BUDGET_EVENT_KEY] = request_chain_budget
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -22213,6 +22255,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "termination_source": getattr(session, "termination_source", ""),
                         "output": _out,
                     }
+                    request_chain_budget = getattr(
+                        session, "request_chain_budget", None
+                    )
+                    if isinstance(request_chain_budget, IterationBudget):
+                        completion_evt[REQUEST_CHAIN_BUDGET_EVENT_KEY] = (
+                            request_chain_budget
+                        )
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
@@ -23949,6 +23998,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        _request_chain_budget: Optional[IterationBudget] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23969,6 +24019,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                _request_chain_budget=_request_chain_budget,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23982,6 +24033,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                _request_chain_budget=_request_chain_budget,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -24105,6 +24157,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        _request_chain_budget: Optional[IterationBudget] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -24390,6 +24443,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            request_chain_budget=_request_chain_budget,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -25303,6 +25357,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending_event = None
             pending = None
+            _leftover_steer_for_followup = False
             if result and adapter and session_key:
                 pending_event = _dequeue_pending_event(adapter, session_key)
                 # /queue overflow: after consuming the adapter's "next-up"
@@ -25355,6 +25410,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _leftover_steer = result.get("pending_steer")
                 if _leftover_steer:
                     pending = _leftover_steer
+                    _leftover_steer_for_followup = True
                     logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
@@ -25603,6 +25659,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
+                _followup_request_chain_budget = _request_chain_budget_for_followup(
+                    turn_ctx.request_chain_budget,
+                    pending_event,
+                    leftover_steer=_leftover_steer_for_followup,
+                )
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
@@ -25616,6 +25677,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform_message_id=next_platform_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    _request_chain_budget=_followup_request_chain_budget,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
