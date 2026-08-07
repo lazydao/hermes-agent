@@ -153,6 +153,13 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
             metadata["slack_team_id"] = str(scope_id)
     if not metadata:
         return None
+    if _platform_name(getattr(source, "platform", None)) == "feishu":
+        user_id = getattr(source, "feishu_topic_starter_user_id", None)
+        if user_id:
+            metadata["feishu_at_user_id"] = str(user_id)
+            user_name = getattr(source, "feishu_topic_starter_user_name", None)
+            if user_name:
+                metadata["feishu_at_user_name"] = str(user_name)
     if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
         metadata["telegram_dm_topic_reply_fallback"] = True
         tid = str(thread_id)

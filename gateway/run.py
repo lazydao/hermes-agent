@@ -25711,6 +25711,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata.setdefault("scope_id", str(team_id))
                 if user_id:
                     metadata.setdefault("user_id", str(user_id))
+        if metadata is not None and getattr(source, "platform", None) == Platform.FEISHU:
+            user_id = getattr(source, "feishu_topic_starter_user_id", None)
+            if user_id:
+                metadata["feishu_at_user_id"] = str(user_id)
+                user_name = getattr(source, "feishu_topic_starter_user_name", None)
+                if user_name:
+                    metadata["feishu_at_user_name"] = str(user_name)
         return metadata
 
     def _thread_metadata_for_target(
@@ -30669,14 +30676,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _status_adapter = self._adapter_for_source(source)
         _status_chat_id = source.chat_id
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
-            # Feishu topics only keep messages inside the topic when they are
-            # sent via the reply API with reply_in_thread=true. Status/interim,
-            # approval, and stream-consumer paths usually only receive metadata,
-            # so carry the triggering message id as a Feishu-specific fallback.
-            _status_thread_metadata: Optional[Dict[str, Any]] = {
-                "thread_id": _progress_thread_id,
-                "reply_to_message_id": event_message_id,
-            }
+            # Feishu keeps replies to topic messages inside the existing topic
+            # by default. Status/interim, approval, and stream-consumer paths
+            # usually only receive metadata, so carry the triggering message id
+            # as the reply anchor.
+            _status_thread_metadata = self._thread_metadata_for_source(
+                source, event_message_id
+            ) or {"thread_id": _progress_thread_id}
+            _status_thread_metadata["reply_to_message_id"] = event_message_id
         else:
             _status_thread_metadata = (
                 self._thread_metadata_for_source(source, event_message_id)

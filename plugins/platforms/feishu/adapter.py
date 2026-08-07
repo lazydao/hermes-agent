@@ -52,6 +52,7 @@ import collections
 import concurrent.futures
 import hashlib
 import hmac
+import html
 import itertools
 import json
 import logging
@@ -191,6 +192,8 @@ _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_OUTBOUND_AT_USER_ID_METADATA = "feishu_at_user_id"
+_OUTBOUND_AT_USER_NAME_METADATA = "feishu_at_user_name"
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -1553,6 +1556,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
+        self._outbound_at_by_message_id: Dict[str, tuple[str, str]] = {}
         # Update prompt button state (prompt_id → {session_key, message_id, chat_id})
         self._update_prompt_state: Dict[int, Dict[str, str]] = {}
         self._update_prompt_counter = itertools.count(1)
@@ -1969,11 +1973,16 @@ class FeishuAdapter(BasePlatformAdapter):
         # uses ``post``. See #26841.
         prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
         last_response = None
+        outbound_at_ref = self._outbound_at_ref_from_metadata(metadata)
 
         try:
-            for chunk in chunks:
+            for index, chunk in enumerate(chunks):
+                chunk_at_ref = outbound_at_ref if index == 0 else None
                 msg_type, payload = self._build_outbound_payload(
                     chunk, prefer_post=prefer_post,
+                )
+                msg_type, payload = self._apply_outbound_at_to_payload(
+                    msg_type, payload, chunk_at_ref,
                 )
                 try:
                     response = await self._feishu_send_with_retry(
@@ -1987,10 +1996,15 @@ class FeishuAdapter(BasePlatformAdapter):
                     if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
                         raise
                     logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                    fallback_msg_type, fallback_payload = self._apply_outbound_at_to_payload(
+                        "text",
+                        json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        chunk_at_ref,
+                    )
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        msg_type=fallback_msg_type,
+                        payload=fallback_payload,
                         reply_to=reply_to,
                         metadata=metadata,
                     )
@@ -2000,13 +2014,22 @@ class FeishuAdapter(BasePlatformAdapter):
                     and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
                 ):
                     logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
+                    fallback_msg_type, fallback_payload = self._apply_outbound_at_to_payload(
+                        "text",
+                        json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        chunk_at_ref,
+                    )
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        msg_type=fallback_msg_type,
+                        payload=fallback_payload,
                         reply_to=reply_to,
                         metadata=metadata,
                     )
+                self._remember_outbound_at(
+                    self._extract_response_field(response, "message_id"),
+                    chunk_at_ref,
+                )
                 last_response = response
 
             return self._finalize_send_result(last_response, "send failed")
@@ -2029,15 +2052,22 @@ class FeishuAdapter(BasePlatformAdapter):
         content = self.format_message(content)
         try:
             msg_type, payload = self._build_outbound_payload(content)
+            at_ref = getattr(self, "_outbound_at_by_message_id", {}).get(str(message_id))
+            msg_type, payload = self._apply_outbound_at_to_payload(msg_type, payload, at_ref)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
             response = await self._run_blocking(self._client.im.v1.message.update, request)
             result = self._finalize_send_result(response, "update failed")
             if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
                 logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
+                fallback_msg_type, fallback_payload = self._apply_outbound_at_to_payload(
+                    "text",
+                    json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
+                    at_ref,
+                )
                 fallback_body = self._build_update_message_body(
-                    msg_type="text",
-                    content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
+                    msg_type=fallback_msg_type,
+                    content=fallback_payload,
                 )
                 fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
                 fallback_response = await self._run_blocking(self._client.im.v1.message.update, fallback_request)
@@ -3338,6 +3368,34 @@ class FeishuAdapter(BasePlatformAdapter):
         _extra = getattr(_config, "extra", None) or {}
         return resolve_channel_prompt(_extra, chat_id, parent_id)
 
+    def _topic_starter_at_ref(
+        self,
+        *,
+        message: Any,
+        sender_id: Any,
+        sender_profile: Dict[str, Optional[str]],
+        is_bot: bool,
+        thread_id: Optional[str],
+        reply_to_message_id: Optional[str],
+    ) -> Optional[tuple[str, str]]:
+        if is_bot or not thread_id or not reply_to_message_id:
+            return None
+        root_id = str(getattr(message, "root_id", "") or "").strip()
+        if not root_id or str(thread_id) != root_id:
+            return None
+
+        # A user can reply to a later bot message in the root reply chain.
+        # Feishu leaves thread_id empty in that case, so Hermes still creates a
+        # new topic from root_id even though parent_id is not the root message.
+        open_id = str(getattr(sender_id, "open_id", "") or "").strip()
+        user_id = str(getattr(sender_id, "user_id", "") or "").strip()
+        user_name = str(sender_profile.get("user_name") or "").strip()
+        if self._bot_identity().matches(open_id=open_id, user_id=user_id, name=user_name):
+            return None
+        if not open_id:
+            return None
+        return open_id, user_name
+
     async def _process_inbound_message(
         self,
         *,
@@ -3405,6 +3463,19 @@ class FeishuAdapter(BasePlatformAdapter):
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
         )
+        topic_starter_at_ref = self._topic_starter_at_ref(
+            message=message,
+            sender_id=sender_id,
+            sender_profile=sender_profile,
+            is_bot=is_bot,
+            thread_id=thread_id,
+            reply_to_message_id=reply_to_message_id,
+        )
+        if topic_starter_at_ref is not None:
+            user_id, user_name = topic_starter_at_ref
+            setattr(source, "feishu_topic_starter_user_id", user_id)
+            if user_name:
+                setattr(source, "feishu_topic_starter_user_name", user_name)
         normalized = MessageEvent(
             text=text,
             message_type=inbound_type,
@@ -4657,6 +4728,72 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
+    @staticmethod
+    def _outbound_at_ref_from_metadata(
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[tuple[str, str]]:
+        if not metadata:
+            return None
+        if not (metadata.get("notify") or metadata.get("expect_edits")):
+            return None
+        user_id = str(metadata.get(_OUTBOUND_AT_USER_ID_METADATA) or "").strip()
+        if not user_id:
+            return None
+        user_name = str(metadata.get(_OUTBOUND_AT_USER_NAME_METADATA) or "").strip()
+        return user_id, user_name
+
+    @staticmethod
+    def _apply_outbound_at_to_payload(
+        msg_type: str,
+        payload: str,
+        at_ref: Optional[tuple[str, str]],
+    ) -> tuple[str, str]:
+        if not at_ref:
+            return msg_type, payload
+        user_id, user_name = at_ref
+        if msg_type == "text":
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                data = {"text": ""}
+            text = str(data.get("text") or "")
+            escaped_user_id = html.escape(user_id, quote=True)
+            data["text"] = f'<at user_id="{escaped_user_id}"></at> {text}'
+            return "text", json.dumps(data, ensure_ascii=False)
+
+        if msg_type != "post":
+            return msg_type, payload
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            data = {"zh_cn": {"content": [[{"tag": "md", "text": ""}]]}}
+        zh_cn = data.setdefault("zh_cn", {})
+        rows = zh_cn.setdefault("content", [])
+        at_element: Dict[str, str] = {"tag": "at", "user_id": user_id}
+        if user_name:
+            at_element["user_name"] = user_name
+        rows.insert(0, [at_element, {"tag": "text", "text": " "}])
+        return "post", json.dumps(data, ensure_ascii=False)
+
+    def _remember_outbound_at(
+        self,
+        message_id: Optional[str],
+        at_ref: Optional[tuple[str, str]],
+    ) -> None:
+        if not message_id or not at_ref:
+            return
+        store = getattr(self, "_outbound_at_by_message_id", None)
+        if store is None:
+            store = {}
+            self._outbound_at_by_message_id = store
+        store[str(message_id)] = at_ref
+        while len(store) > _FEISHU_BOT_MSG_TRACK_SIZE:
+            try:
+                store.pop(next(iter(store)))
+            except StopIteration:
+                break
+
     def _build_outbound_payload(
         self, content: str, *, prefer_post: bool = False,
     ) -> tuple[str, str]:
@@ -4843,7 +4980,10 @@ class FeishuAdapter(BasePlatformAdapter):
         effective_reply_to = reply_to
         if not effective_reply_to and metadata and metadata.get("thread_id"):
             effective_reply_to = metadata.get("reply_to_message_id")
-        reply_in_thread = bool((metadata or {}).get("thread_id"))
+        # ``reply_in_thread=true`` starts a new topic around the target message.
+        # Replies to a message already in a topic stay in that topic by default,
+        # so omit the flag here instead of accidentally forking a new topic.
+        reply_in_thread = None if (metadata or {}).get("thread_id") else False
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
@@ -5125,16 +5265,22 @@ class FeishuAdapter(BasePlatformAdapter):
         return SimpleNamespace(app_id=app_id, lang=lang)
 
     @staticmethod
-    def _build_reply_message_body(*, content: str, msg_type: str, reply_in_thread: bool, uuid_value: str) -> Any:
+    def _build_reply_message_body(
+        *,
+        content: str,
+        msg_type: str,
+        reply_in_thread: Optional[bool],
+        uuid_value: str,
+    ) -> Any:
         if ReplyMessageRequestBody is not None:
-            return (
+            builder = (
                 ReplyMessageRequestBody.builder()
                 .content(content)
                 .msg_type(msg_type)
-                .reply_in_thread(reply_in_thread)
-                .uuid(uuid_value)
-                .build()
             )
+            if reply_in_thread is not None:
+                builder = builder.reply_in_thread(reply_in_thread)
+            return builder.uuid(uuid_value).build()
         return SimpleNamespace(
             content=content,
             msg_type=msg_type,
