@@ -187,6 +187,18 @@ For production use, set an allowlist of Feishu Open IDs:
 FEISHU_ALLOWED_USERS=ou_xxx,ou_yyy
 ```
 
+To allow everyone in a specific group chat without granting DM access or access
+from other groups, add an explicit rule in `config.yaml`:
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      group_rules:
+        "oc_xxx":
+          policy: "open"
+```
+
 If you leave the allowlist empty, anyone who can reach the bot may be able to use it. In group chats, the allowlist is checked against the sender's open_id before the message is processed.
 
 ### Webhook Encryption Key
@@ -523,6 +535,12 @@ platforms:
 | `blacklist` | Everyone except users in the group's `blacklist` can use the bot |
 | `admin_only` | Only users in the global `admins` list can use the bot in this group |
 | `disabled` | Bot ignores all messages in this group |
+
+An explicit `group_rules` entry also authorizes that chat at the gateway layer.
+For example, `policy: open` allows everyone in that named group without granting
+those users DM access or access from any other group. The top-level/default
+`group_policy: open` does not provide this authorization; broad access still
+requires an explicit allow-all setting.
 
 Set `require_mention: false` on a `group_rules` entry to skip the @-mention requirement for that specific chat. When omitted, the chat inherits the global `FEISHU_REQUIRE_MENTION` value.
 
