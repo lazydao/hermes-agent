@@ -416,6 +416,16 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+@contextmanager
+def session_message_id_scope(message_id: str) -> Iterator[None]:
+    """Bind the triggering platform message ID for exactly one agent turn."""
+    token = _SESSION_MESSAGE_ID.set(message_id)
+    try:
+        yield
+    finally:
+        _SESSION_MESSAGE_ID.reset(token)
+
+
 # Surfaces that are not a human chat channel. The gateway binds a platform
 # value (``telegram``) to HERMES_SESSION_PLATFORM, while the CLI, TUI, and
 # desktop bind HERMES_SESSION_SOURCE (``cli``, ``tui``, ``desktop``) and leave
