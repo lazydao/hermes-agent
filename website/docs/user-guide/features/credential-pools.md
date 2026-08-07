@@ -149,6 +149,14 @@ The shared provider reads and writes the pool in the default Hermes root
 are coordinated across profiles. Other providers and singleton auth state stay
 profile-local. Every participating profile must enable the same setting.
 
+This opt-in does not automatically migrate an existing profile-local pool.
+Before enabling it, run `hermes auth list` from the default profile and make
+sure that provider already has usable credentials in the default Hermes root;
+log in or add them there first if needed. Once sharing is enabled, any older
+profile-local entries for that provider remain on disk but are intentionally
+ignored so a profile cannot silently fall back to credentials outside the
+shared pool. Disabling the setting makes those local entries visible again.
+
 ## Error Recovery
 
 The pool handles different errors differently:
