@@ -3045,6 +3045,7 @@ from gateway.restart import (
     parse_signal_interrupt_grace_timeout,
     resolve_cron_drain_budget,
 )
+from gateway.request_lock import GatewayRequestLock
 
 
 from gateway.whatsapp_identity import (
@@ -7416,6 +7417,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        self._request_lock = GatewayRequestLock(self.config.request_lock)
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -19609,7 +19611,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        _request_lock_lease = None
         try:
+            request_lock = getattr(self, "_request_lock", None)
+            if request_lock is not None:
+                _request_lock_lease = await request_lock.acquire(_quick_key)
             try:
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
@@ -19641,6 +19647,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
+            if _request_lock_lease is not None:
+                _request_lock_lease.release()
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
             # (_moa_restore_override), which is discarded once the event goes
