@@ -47,6 +47,10 @@ Wire protocol
     # Inject context for pre_llm_call:
     {"context": "Today is Friday"}
 
+    # Gate a final response (bounded continuation or fail-closed replacement):
+    {"action": "continue", "message": "Persist first", "fallback": "Not persisted"}
+    {"action": "replace", "message": "The required check did not pass"}
+
     # Silent no-op:
     <empty or any non-matching JSON object>
 
@@ -92,6 +96,17 @@ emitted by each built-in hook site.
     interrupted     – bool, True when the user interrupted
     model           – model name
     platform        – platform identifier
+
+``pre_response`` (emitted from ``agent/conversation_loop.py``)::
+
+    task_id          – current task id
+    turn_id          – current turn id
+    platform         – platform identifier
+    model            – model name
+    attempt          – prior continuation count for this turn
+    user_message     – clean inbound user message
+    platform_message_id – messaging platform's original message id, if any
+    final_response   – response text the model is attempting to return
 
 ``subagent_stop`` (emitted from ``tools/delegate_tool.py``)::
 
@@ -613,6 +628,21 @@ def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
             message = data.get("message") or data.get("reason")
             if isinstance(message, str) and message.strip():
                 return {"action": "continue", "message": message.strip()}
+        return None
+
+    if event == "pre_response":
+        action = str(data.get("action") or "").strip().lower()
+        message = data.get("message")
+        if (
+            action in {"continue", "replace"}
+            and isinstance(message, str)
+            and message.strip()
+        ):
+            result = {"action": action, "message": message.strip()}
+            fallback = data.get("fallback")
+            if isinstance(fallback, str) and fallback.strip():
+                result["fallback"] = fallback.strip()
+            return result
         return None
 
     context = data.get("context")

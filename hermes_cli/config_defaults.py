@@ -70,6 +70,9 @@ DEFAULT_CONFIG = {
         # provider hiccups on a single provider.
         "api_max_retries": 3,
         "service_tier": "",
+        # Cache-stable system-prompt fragments loaded by the gateway before
+        # the inline agent.system_prompt value.
+        "system_prompt_files": [],
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false
@@ -146,6 +149,9 @@ DEFAULT_CONFIG = {
         # Upper bound on consecutive `pre_verify` "continue" nudges in a single
         # turn, so a user/plugin hook can never trap the loop.
         "max_verify_nudges": 3,
+        # Upper bound on consecutive pre_response continuation directives.
+        # Replacement directives remain available after the bound.
+        "max_pre_response_nudges": 2,
         # Verification closure: after the agent edits files in a code workspace,
         # do not accept a final answer until fresh verification evidence exists
         # or the agent explains why it cannot run checks. The loop is bounded

@@ -5305,6 +5305,10 @@ class TurnRunner:
                 "conversation_history": agent_history,
                 "task_id": ctx.session_id,
             }
+            if ctx.event_message_id:
+                _conversation_kwargs["platform_message_id"] = str(
+                    ctx.event_message_id
+                )
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
@@ -7915,16 +7919,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _load_ephemeral_system_prompt() -> str:
-        """Load ephemeral system prompt from config or env var.
+        """Load ephemeral system prompt from config, files, or env var.
         
         Checks HERMES_EPHEMERAL_SYSTEM_PROMPT env var first, then falls back to
-        agent.system_prompt in ~/.hermes/config.yaml.
+        ``agent.system_prompt_files`` followed by ``agent.system_prompt`` in
+        ~/.hermes/config.yaml. Files are read once at gateway startup so the
+        resulting prompt remains cache-stable for the gateway lifetime.
         """
         prompt = os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
         if prompt:
             return prompt
         cfg = _load_gateway_runtime_config()
-        return str(cfg_get(cfg, "agent", "system_prompt", default="") or "").strip()
+        blocks: List[str] = []
+        configured_files = cfg_get(cfg, "agent", "system_prompt_files", default=[])
+        if isinstance(configured_files, str):
+            configured_files = [configured_files]
+        if isinstance(configured_files, list):
+            for configured_path in configured_files:
+                if not isinstance(configured_path, str) or not configured_path.strip():
+                    continue
+                path = Path(os.path.expandvars(configured_path.strip())).expanduser()
+                if not path.is_absolute():
+                    path = _hermes_home / path
+                if not path.is_file():
+                    logger.warning("System prompt file not found: %s", path)
+                    continue
+                try:
+                    content = path.read_text(encoding="utf-8").strip()
+                except Exception as exc:
+                    logger.warning("Failed to load system prompt file %s: %s", path, exc)
+                    continue
+                if content:
+                    blocks.append(content)
+
+        configured_prompt = cfg_get(cfg, "agent", "system_prompt", default="")
+        if isinstance(configured_prompt, str):
+            configured_prompts = [configured_prompt]
+        elif isinstance(configured_prompt, list):
+            configured_prompts = configured_prompt
+        else:
+            configured_prompts = []
+        blocks.extend(
+            item.strip()
+            for item in configured_prompts
+            if isinstance(item, str) and item.strip()
+        )
+        return "\n\n".join(blocks)
 
     def _resolve_model_for_channel(
         self,

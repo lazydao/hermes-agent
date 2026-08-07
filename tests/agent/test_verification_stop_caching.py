@@ -33,6 +33,7 @@ def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):
 
     assert "_verification_stop_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
     assert "_pre_verify_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
+    assert "_pre_response_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
 
     # The nudge messages ARE scaffolding (they carry the synthetic flag).
     assert ra._is_ephemeral_scaffolding(
