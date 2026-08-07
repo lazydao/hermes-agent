@@ -556,6 +556,7 @@ def build_turn_context(
     persist_user_message: Optional[Any],
     persist_user_timestamp: Optional[float] = None,
     platform_message_id: Optional[str] = None,
+    iteration_budget: Optional[IterationBudget] = None,
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
@@ -728,7 +729,17 @@ def build_turn_context(
         agent._compression_warning = None  # send once
 
     # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
-    agent.iteration_budget = IterationBudget(agent.max_iterations)
+    # Gateway-internal continuation turns can share the originating external
+    # request's budget. Ordinary user turns omit this argument and retain the
+    # historical fresh-per-turn behavior.
+    if iteration_budget is None:
+        iteration_budget = getattr(agent, "_next_iteration_budget", None)
+    agent._next_iteration_budget = None
+    agent.iteration_budget = (
+        iteration_budget
+        if isinstance(iteration_budget, IterationBudget)
+        else IterationBudget(agent.max_iterations)
+    )
 
     # Wall-clock run budget: per-run_conversation clock. Only stamped when a
     # budget is configured so the default path stays clock-free; the wrap-up

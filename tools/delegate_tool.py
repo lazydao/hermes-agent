@@ -4497,6 +4497,7 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            request_chain_budget=getattr(parent_agent, "iteration_budget", None),
         )
 
         if dispatch.get("status") == "dispatched":

@@ -48,6 +48,8 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY
+
 from hermes_cli.config import get_hermes_home
 
 from agent.redact import redact_sensitive_text
@@ -413,6 +415,9 @@ class ProcessSession:
     # boundary (/new), instead of injecting them into the chat's NEW session.
     parent_session_id: str = ""
     notify_on_complete: bool = False             # Queue agent notification on exit
+    # Process-local only: omitted from crash checkpoints because the object
+    # contains a lock and a restarted gateway starts a new runtime chain.
+    request_chain_budget: Any = field(default=None, repr=False)
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -644,6 +649,7 @@ class ProcessRegistry:
                         f"Falling back to notify_on_complete semantics; you'll get "
                         f"exactly one notification when the process exits."
                     ),
+                    REQUEST_CHAIN_BUDGET_EVENT_KEY: session.request_chain_budget,
                 })
             return
 
@@ -678,6 +684,7 @@ class ProcessRegistry:
             "user_name": session.watcher_user_name,
             "thread_id": session.watcher_thread_id,
             "message_id": session.watcher_message_id,
+            REQUEST_CHAIN_BUDGET_EVENT_KEY: session.request_chain_budget,
         }
         _redact_process_result(notification)
         self.completion_queue.put(notification)
@@ -1046,6 +1053,7 @@ class ProcessRegistry:
         env_vars: dict = None,
         use_pty: bool = False,
         owner_task_id: str = "",
+        request_chain_budget: Any = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -1074,6 +1082,7 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            request_chain_budget=request_chain_budget,
         )
 
         pty_scope_attempted = False
@@ -1291,6 +1300,7 @@ class ProcessRegistry:
         session_key: str = "",
         timeout: int = 10,
         owner_task_id: str = "",
+        request_chain_budget: Any = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1313,6 +1323,7 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            request_chain_budget=request_chain_budget,
         )
 
         # Run the command in the sandbox with output capture
@@ -1661,6 +1672,7 @@ class ProcessRegistry:
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
+                REQUEST_CHAIN_BUDGET_EVENT_KEY: session.request_chain_budget,
             }
             _redact_process_result(notification)
             self.completion_queue.put(notification)

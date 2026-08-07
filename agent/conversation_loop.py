@@ -1909,6 +1909,7 @@ def run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
     platform_message_id: Optional[str] = None,
+    iteration_budget: Optional[IterationBudget] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1935,6 +1936,9 @@ def run_conversation(
             (e.g. a delegation's task count).
         platform_message_id: Optional messaging-platform identifier to store
             on the persisted user row and expose to per-turn plugin hooks.
+        iteration_budget: Optional request-chain budget supplied by the
+            gateway for an internal continuation. Ordinary user turns omit it
+            and receive a fresh budget.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -1985,6 +1989,7 @@ def run_conversation(
         persist_user_message,
         persist_user_timestamp,
         platform_message_id,
+        iteration_budget,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,

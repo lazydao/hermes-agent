@@ -2828,6 +2828,7 @@ def terminal_tool(
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
     _host_local: bool = False,
+    request_chain_budget: Any = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -3314,6 +3315,7 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        request_chain_budget=request_chain_budget,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -3323,6 +3325,7 @@ def terminal_tool(
                         task_id=effective_task_id,
                         owner_task_id=task_id or effective_task_id,
                         session_key=session_key,
+                        request_chain_budget=request_chain_budget,
                     )
 
                 result_data = {
@@ -4209,6 +4212,7 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=notify_on_complete,
         watch_patterns=watch_patterns,
+        request_chain_budget=kw.get("request_chain_budget"),
     )
 
 

@@ -14,6 +14,10 @@ import time
 import pytest
 from unittest.mock import MagicMock, patch
 
+from agent.iteration_budget import (
+    IterationBudget,
+    REQUEST_CHAIN_BUDGET_EVENT_KEY,
+)
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
@@ -70,6 +74,19 @@ class TestCompletionQueue:
     def test_queue_exists(self, registry):
         assert hasattr(registry, "completion_queue")
         assert registry.completion_queue.empty()
+
+    def test_completion_preserves_originating_request_budget(self, registry):
+        budget = IterationBudget(90)
+        s = _make_session(notify_on_complete=True, output="done", exit_code=0)
+        s.request_chain_budget = budget
+        s.exited = True
+        registry._running[s.id] = s
+
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(s)
+
+        completion = registry.completion_queue.get_nowait()
+        assert completion[REQUEST_CHAIN_BUDGET_EVENT_KEY] is budget
 
 
     def test_move_to_finished_idempotent_no_duplicate(self, registry):

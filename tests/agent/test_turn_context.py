@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor
+from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
     PreflightCompressionTimedOut,
     TurnContext,
@@ -274,6 +275,33 @@ def test_platform_message_id_reaches_persistence_and_pre_llm_hook():
 
     assert agent._persist_user_platform_message_id == "platform-message-123"
     assert seen["platform_message_id"] == "platform-message-123"
+
+
+def test_ordinary_user_turn_gets_a_fresh_iteration_budget():
+    agent = _FakeAgent()
+    stale_budget = IterationBudget(90)
+    assert stale_budget.consume()
+    agent.iteration_budget = stale_budget
+
+    _build(agent)
+
+    assert agent.iteration_budget is not stale_budget
+    assert agent.iteration_budget.max_total == 90
+    assert agent.iteration_budget.used == 0
+
+
+def test_internal_continuation_reuses_one_shot_request_budget():
+    agent = _FakeAgent()
+    request_budget = IterationBudget(90)
+    for _ in range(3):
+        assert request_budget.consume()
+    agent._next_iteration_budget = request_budget
+
+    _build(agent)
+
+    assert agent.iteration_budget is request_budget
+    assert agent.iteration_budget.used == 3
+    assert agent._next_iteration_budget is None
 
 
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────

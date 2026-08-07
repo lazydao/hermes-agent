@@ -15,6 +15,10 @@ import time
 import pytest
 from unittest.mock import patch
 
+from agent.iteration_budget import (
+    IterationBudget,
+    REQUEST_CHAIN_BUDGET_EVENT_KEY,
+)
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
@@ -84,6 +88,16 @@ class TestCheckWatchPatterns:
         assert evt["pattern"] == "ERROR"
         assert "disk full" in evt["output"]
         assert evt["session_id"] == "proc_test_watch"
+
+    def test_match_preserves_originating_request_budget(self, registry):
+        budget = IterationBudget(90)
+        session = _make_session(watch_patterns=["ERROR"])
+        session.request_chain_budget = budget
+
+        registry._check_watch_patterns(session, "ERROR: disk full\n")
+
+        evt = registry.completion_queue.get_nowait()
+        assert evt[REQUEST_CHAIN_BUDGET_EVENT_KEY] is budget
 
 
     def test_output_truncation(self, registry):

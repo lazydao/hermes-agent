@@ -1145,6 +1145,7 @@ def init_agent(
     agent._persist_user_message_timestamp = None
     agent._persist_user_platform_message_id = None
     agent._next_platform_message_id = None
+    agent._next_iteration_budget = None
 
     # Cache anthropic image-to-text fallbacks per image payload/URL so a
     # single tool loop does not repeatedly re-run auxiliary vision on the

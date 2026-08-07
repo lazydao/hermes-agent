@@ -8710,6 +8710,7 @@ class AIAgent:
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
         platform_message_id: Optional[str] = None,
+        iteration_budget: Optional[IterationBudget] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -9085,6 +9086,7 @@ class AIAgent:
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
                         platform_message_id=platform_message_id,
+                        iteration_budget=iteration_budget,
                     )
                 finally:
                     # The lease remains held through relay/task finalization, but

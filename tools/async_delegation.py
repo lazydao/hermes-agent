@@ -46,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
+from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY
 from hermes_constants import get_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
@@ -773,6 +774,7 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    request_chain_budget: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -839,6 +841,7 @@ def dispatch_async_delegation(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        REQUEST_CHAIN_BUDGET_EVENT_KEY: request_chain_budget,
     }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
@@ -1010,6 +1013,9 @@ def _push_completion_event(
         if _k in result:
             evt[_k] = result[_k]
     _persist_completion(evt, result)
+    request_chain_budget = record.get(REQUEST_CHAIN_BUDGET_EVENT_KEY)
+    if request_chain_budget is not None:
+        evt[REQUEST_CHAIN_BUDGET_EVENT_KEY] = request_chain_budget
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -1036,6 +1042,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    request_chain_budget: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1086,6 +1093,7 @@ def dispatch_async_delegation_batch(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        REQUEST_CHAIN_BUDGET_EVENT_KEY: request_chain_budget,
     }
     with _records_lock:
         running = sum(
@@ -1224,6 +1232,9 @@ def _push_batch_completion_event(
         if _k in combined:
             evt[_k] = combined[_k]
     _persist_completion(evt, combined)
+    request_chain_budget = event_record.get(REQUEST_CHAIN_BUDGET_EVENT_KEY)
+    if request_chain_budget is not None:
+        evt[REQUEST_CHAIN_BUDGET_EVENT_KEY] = request_chain_budget
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -1468,7 +1479,11 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             item = {
                 k: v
                 for k, v in r.items()
-                if k not in {"interrupt_fn", "progress_fn"}
+                if k not in {
+                    "interrupt_fn",
+                    "progress_fn",
+                    REQUEST_CHAIN_BUDGET_EVENT_KEY,
+                }
                 and not k.startswith("_")
             }
             status = r.get("status")

@@ -16,6 +16,10 @@ import time
 
 import pytest
 
+from agent.iteration_budget import (
+    IterationBudget,
+    REQUEST_CHAIN_BUDGET_EVENT_KEY,
+)
 from tools import async_delegation as ad
 from tools.process_registry import process_registry, format_process_notification
 
@@ -628,6 +632,8 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
+    parent.iteration_budget = IterationBudget(90)
+    assert parent.iteration_budget.consume()
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
@@ -674,6 +680,9 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert evt.get("is_batch") is True
     assert len(evt["results"]) == 1
     assert evt["results"][0]["summary"] == "done: the real task"
+    assert evt[REQUEST_CHAIN_BUDGET_EVENT_KEY] is parent.iteration_budget
+    # Runtime-only budget objects must never leak into the JSON status surface.
+    json.dumps(ad.list_async_delegations())
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
