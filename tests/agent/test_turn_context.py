@@ -236,6 +236,7 @@ def test_ordinary_user_turn_gets_a_fresh_iteration_budget():
     assert agent.iteration_budget is not stale_budget
     assert agent.iteration_budget.max_total == 90
     assert agent.iteration_budget.used == 0
+    assert agent._async_completion_uses_shared_budget is False
 
 
 def test_internal_continuation_reuses_one_shot_request_budget():
@@ -250,6 +251,7 @@ def test_internal_continuation_reuses_one_shot_request_budget():
     assert agent.iteration_budget is request_budget
     assert agent.iteration_budget.used == 3
     assert agent._next_iteration_budget is None
+    assert agent._async_completion_uses_shared_budget is True
 
 
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
@@ -407,7 +409,6 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
 
 
 
