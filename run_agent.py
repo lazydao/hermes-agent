@@ -114,7 +114,7 @@ from agent.process_bootstrap import (
     _SafeWriter,  # noqa: F401  # re-exported for tests that `from run_agent import _SafeWriter`
     _get_proxy_for_base_url,
 )
-from agent.iteration_budget import IterationBudget
+from agent.iteration_budget import IterationBudget, _restore_foreground_iteration_cap
 from agent.interrupt_compat import request_hard_interrupt
 
 
@@ -9176,10 +9176,13 @@ class AIAgent:
                         pass
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
                         self._relay_pending_turn_id = None
-                    if acct_token is not None:
-                        reset_accounting_context(acct_token)
-                    if token is not None:
-                        reset_conversation_context(token)
+                    try:
+                        if acct_token is not None:
+                            reset_accounting_context(acct_token)
+                        if token is not None:
+                            reset_conversation_context(token)
+                    finally:
+                        _restore_foreground_iteration_cap(self)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

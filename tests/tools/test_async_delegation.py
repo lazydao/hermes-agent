@@ -13,12 +13,15 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from agent.iteration_budget import (
     IterationBudget,
     REQUEST_CHAIN_BUDGET_EVENT_KEY,
+    _apply_foreground_iteration_cap,
+    _restore_foreground_iteration_cap,
 )
 from tools import async_delegation as ad
 from tools.process_registry import process_registry, format_process_notification
@@ -123,6 +126,113 @@ def test_connect_preserves_wal_and_applies_macos_durability_barriers(
         assert conn.execute("PRAGMA checkpoint_fullfsync").fetchone()[0] == 1
     finally:
         conn.close()
+def _budget_with_used(max_total, used):
+    budget = IterationBudget(max_total)
+    for _ in range(used):
+        assert budget.consume()
+    return budget
+
+
+def test_completion_reserve_caps_foreground_without_raising_total(monkeypatch):
+    import tools.delegate_tool as dt
+
+    parent = SimpleNamespace(
+        max_iterations=90,
+        _api_call_count=10,
+        _async_completion_uses_shared_budget=True,
+        iteration_budget=_budget_with_used(90, 10),
+    )
+    monkeypatch.setattr(
+        dt,
+        "_load_config",
+        lambda: {"continuation_reserve_iterations": 20},
+    )
+
+    assert dt._plan_async_completion_reserve(parent) == (70, 20)
+    assert parent.max_iterations == 90
+    assert parent.iteration_budget.max_total == 90
+
+
+def test_completion_reserve_shrinks_safely_after_late_dispatch(monkeypatch):
+    import tools.delegate_tool as dt
+
+    parent = SimpleNamespace(
+        max_iterations=90,
+        _api_call_count=85,
+        _async_completion_uses_shared_budget=True,
+        iteration_budget=_budget_with_used(90, 85),
+    )
+    monkeypatch.setattr(
+        dt,
+        "_load_config",
+        lambda: {"continuation_reserve_iterations": 20},
+    )
+
+    assert dt._plan_async_completion_reserve(parent) == (86, 4)
+
+
+def test_completion_reserve_is_noop_without_shared_reentry_budget(monkeypatch):
+    import tools.delegate_tool as dt
+
+    parent = SimpleNamespace(
+        max_iterations=90,
+        _api_call_count=10,
+        _async_completion_uses_shared_budget=False,
+        iteration_budget=_budget_with_used(90, 10),
+    )
+    monkeypatch.setattr(
+        dt,
+        "_load_config",
+        lambda: {"continuation_reserve_iterations": 20},
+    )
+
+    assert dt._plan_async_completion_reserve(parent) == (None, 0)
+
+
+def test_foreground_cap_can_be_restored_after_turn():
+    parent = SimpleNamespace(max_iterations=90, iteration_budget=IterationBudget(90))
+
+    _apply_foreground_iteration_cap(parent, 70)
+    assert parent.max_iterations == 70
+
+    _restore_foreground_iteration_cap(parent)
+    assert parent.max_iterations == 90
+    assert "_foreground_iteration_cap_original" not in parent.__dict__
+
+
+def test_reserve_notice_requires_a_live_shared_budget():
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_restored",
+        "goal": "finish",
+        "status": "completed",
+        "summary": "done",
+        "completion_reserve_iterations": 20,
+    }
+
+    text = format_process_notification(evt)
+
+    assert text is not None
+    assert "Continuation budget" not in text
+
+
+def test_reserve_notice_reports_only_the_remaining_shared_allowance():
+    budget = _budget_with_used(90, 83)
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_later_sibling",
+        "goal": "finish",
+        "status": "completed",
+        "summary": "done",
+        "completion_reserve_iterations": 20,
+        REQUEST_CHAIN_BUDGET_EVENT_KEY: budget,
+    }
+
+    text = format_process_notification(evt)
+
+    assert text is not None
+    assert "Continuation budget snapshot: 7" in text
+    assert "shared across completion turns" in text
 
 
 def test_active_for_session_counts_every_live_delegation_state():
@@ -632,6 +742,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
+    parent._async_completion_uses_shared_budget = True
     parent.iteration_budget = IterationBudget(90)
     assert parent.iteration_budget.consume()
     fake_child = MagicMock()
@@ -657,6 +768,11 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", slow_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(
+        dt,
+        "_load_config",
+        lambda: {"continuation_reserve_iterations": 20},
+    )
     out = dt.delegate_task(
         goal="the real task", context="ctx",
         background=True, parent_agent=parent,
@@ -667,6 +783,10 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert parsed["status"] == "dispatched"
     assert parsed["mode"] == "background"
     assert parsed["delegation_id"].startswith("deleg_")
+    assert parsed["completion_reserve_iterations"] == 20
+    assert parsed["foreground_iteration_cap"] == 70
+    assert parent.max_iterations == 70
+    assert parent.iteration_budget.max_total == 90
     # Non-blocking invariant: delegate_task returned while the child is STILL
     # blocked on the closed gate, so no completion event exists yet.
     assert process_registry.completion_queue.empty()
@@ -681,11 +801,13 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert len(evt["results"]) == 1
     assert evt["results"][0]["summary"] == "done: the real task"
     assert evt[REQUEST_CHAIN_BUDGET_EVENT_KEY] is parent.iteration_budget
+    assert evt["completion_reserve_iterations"] == 20
     # Runtime-only budget objects must never leak into the JSON status surface.
     json.dumps(ad.list_async_delegations())
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+    assert "Continuation budget snapshot: 20" in text
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
@@ -825,8 +947,6 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
-
 def test_single_task_truncation_banner_when_max_iterations():
     """A single async subagent that hit its iteration cap (exit_reason=
     max_iterations) must surface a TRUNCATED marker in the formatted result,

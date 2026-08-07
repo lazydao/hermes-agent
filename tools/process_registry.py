@@ -48,7 +48,7 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY
+from agent.iteration_budget import IterationBudget, REQUEST_CHAIN_BUDGET_EVENT_KEY
 
 from hermes_cli.config import get_hermes_home
 
@@ -3079,6 +3079,18 @@ def _delegation_model_not_found_notice(results) -> "list[str] | None":
     except Exception:
         pass
     return lines
+def _completion_reserve_remaining(evt: dict) -> int:
+    """Return the live shared allowance represented by a completion event."""
+    reserve = evt.get("completion_reserve_iterations", 0)
+    budget = evt.get(REQUEST_CHAIN_BUDGET_EVENT_KEY)
+    if (
+        not isinstance(reserve, int)
+        or isinstance(reserve, bool)
+        or reserve <= 0
+        or not isinstance(budget, IterationBudget)
+    ):
+        return 0
+    return min(reserve, budget.remaining)
 
 
 def _format_async_delegation(evt: dict) -> str:
@@ -3126,6 +3138,22 @@ def _format_async_delegation(evt: dict) -> str:
             "dispatching — act on these or re-dispatch if things have changed.",
             "",
         ]
+        completion_reserve = _completion_reserve_remaining(evt)
+        if completion_reserve > 0:
+            lines.extend(
+                [
+                    f"Continuation budget snapshot: {completion_reserve} parent "
+                    "iteration(s) remained when this notification was prepared. "
+                    "The request-chain allowance is shared across completion "
+                    "turns, so fewer may be available when this turn runs.",
+                    "Use this turn to integrate the returned evidence and "
+                    "finish the original task's required persistence, "
+                    "verification, and closure. Do not start optional scope "
+                    "expansion unless it is required to resolve a concrete "
+                    "blocker.",
+                    "",
+                ]
+            )
         if isinstance(dispatched_at, (int, float)):
             ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(dispatched_at))
             age = f" ({_format_age(completed_at - dispatched_at)} ago)"
@@ -3204,6 +3232,21 @@ def _format_async_delegation(evt: dict) -> str:
         "you can act on the result or re-dispatch if things have changed.",
         "",
     ]
+    completion_reserve = _completion_reserve_remaining(evt)
+    if completion_reserve > 0:
+        lines.extend(
+            [
+                f"Continuation budget snapshot: {completion_reserve} parent "
+                "iteration(s) remained when this notification was prepared. "
+                "The request-chain allowance is shared across completion "
+                "turns, so fewer may be available when this turn runs.",
+                "Use this turn to integrate the returned evidence and finish "
+                "the original task's required persistence, verification, and "
+                "closure. Do not start optional scope expansion unless it is "
+                "required to resolve a concrete blocker.",
+                "",
+            ]
+        )
     if isinstance(dispatched_at, (int, float)):
         ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(dispatched_at))
         lines.append(f"Dispatched: {ts}{age}")

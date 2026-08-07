@@ -2144,6 +2144,11 @@ DEFAULT_CONFIG = {
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
         "max_concurrent_children": 10,  # unified concurrency cap: max parallel children per batch
+        # On frontends that carry one request-chain budget into async
+        # completion turns (currently the messaging gateway), keep part of
+        # that budget unused by the foreground turn after a successful
+        # background dispatch. CLI/TUI completions start with a fresh budget.
+        "continuation_reserve_iterations": 0,
                                        # AND max concurrent background (background=true)
                                        # delegation units. New async dispatches beyond the cap
                                        # fall back to synchronous execution. Floor of 1, no ceiling.

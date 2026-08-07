@@ -257,6 +257,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
             "scope_id", "user_id", "user_name",
+            "completion_reserve_iterations",
         )
         if key in record
     }
@@ -373,6 +374,9 @@ def recover_abandoned_delegations() -> int:
                 # Restore the durable wake target so completions recovered
                 # after a restart remain routable to api_server sessions.
                 "origin_session_id": origin_session_id or "",
+                "completion_reserve_iterations": task.get(
+                    "completion_reserve_iterations", 0
+                ),
                 "parent_session_id": parent_id, "goal": task.get("goal", ""),
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
@@ -1043,6 +1047,7 @@ def dispatch_async_delegation_batch(
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
     request_chain_budget: Optional[Any] = None,
+    completion_reserve_iterations: int = 0,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1093,6 +1098,9 @@ def dispatch_async_delegation_batch(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        "completion_reserve_iterations": max(
+            0, int(completion_reserve_iterations or 0)
+        ),
         REQUEST_CHAIN_BUDGET_EVENT_KEY: request_chain_budget,
     }
     with _records_lock:
@@ -1216,6 +1224,9 @@ def _push_batch_completion_event(
         "total_duration_seconds": combined.get("total_duration_seconds"),
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
+        "completion_reserve_iterations": event_record.get(
+            "completion_reserve_iterations", 0
+        ),
     }
     # Routing origin captured at dispatch (see _capture_routing_origin).
     for _k in ("scope_id", "user_id", "user_name"):

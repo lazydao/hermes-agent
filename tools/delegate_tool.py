@@ -34,6 +34,7 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from agent.iteration_budget import _apply_foreground_iteration_cap
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
 
@@ -983,6 +984,64 @@ def _get_max_async_children() -> int:
             "delegations too. Remove the stale key from config.yaml."
         )
     return _get_max_concurrent_children()
+
+
+def _get_continuation_reserve_iterations() -> int:
+    """Return the parent budget reserved for an async completion turn."""
+    value = _load_config().get("continuation_reserve_iterations", 0)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.continuation_reserve_iterations=%r is not a valid "
+            "integer; disabling the reserve",
+            value,
+        )
+        return 0
+
+
+def _plan_async_completion_reserve(parent_agent) -> tuple[Optional[int], int]:
+    """Plan a foreground cap that leaves budget for async result handling."""
+    requested_reserve = _get_continuation_reserve_iterations()
+    if requested_reserve <= 0 or parent_agent is None:
+        return None, 0
+
+    if getattr(parent_agent, "_async_completion_uses_shared_budget", False) is not True:
+        return None, 0
+
+    budget = getattr(parent_agent, "iteration_budget", None)
+    budget_max = getattr(budget, "max_total", None)
+    budget_remaining = getattr(budget, "remaining", None)
+    if (
+        not isinstance(budget_max, int)
+        or isinstance(budget_max, bool)
+        or budget_max <= 0
+        or not isinstance(budget_remaining, int)
+        or isinstance(budget_remaining, bool)
+        or budget_remaining <= 0
+    ):
+        return None, 0
+
+    current_calls = getattr(parent_agent, "_api_call_count", None)
+    if not isinstance(current_calls, int) or isinstance(current_calls, bool):
+        used = getattr(budget, "used", 0)
+        current_calls = used if isinstance(used, int) else 0
+    current_calls = max(0, current_calls)
+
+    current_cap = getattr(parent_agent, "max_iterations", None)
+    if not isinstance(current_cap, int) or isinstance(current_cap, bool) or current_cap <= 0:
+        current_cap = budget_max
+
+    foreground_allowance = max(1, budget_remaining - requested_reserve)
+    planned_cap = min(current_cap, current_calls + foreground_allowance)
+    calls_until_cap = max(0, planned_cap - current_calls)
+    effective_reserve = min(
+        requested_reserve,
+        max(0, budget_remaining - calls_until_cap),
+    )
+    if effective_reserve <= 0:
+        return None, 0
+    return planned_cap, effective_reserve
 
 
 def _get_child_timeout() -> Optional[float]:
@@ -4478,6 +4537,9 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        _planned_foreground_cap, _completion_reserve = (
+            _plan_async_completion_reserve(parent_agent)
+        )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -4498,9 +4560,21 @@ def delegate_task(
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
             request_chain_budget=getattr(parent_agent, "iteration_budget", None),
+            completion_reserve_iterations=_completion_reserve,
         )
 
         if dispatch.get("status") == "dispatched":
+            if _planned_foreground_cap is not None:
+                _apply_foreground_iteration_cap(
+                    parent_agent,
+                    _planned_foreground_cap,
+                )
+                logger.info(
+                    "delegate_task: capped the current foreground turn at %d "
+                    "to retain %d shared iteration(s) for async completion",
+                    _planned_foreground_cap,
+                    _completion_reserve,
+                )
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -4522,6 +4596,15 @@ def delegate_task(
                 "goals": _goals,
                 "note": note,
             }
+            if _completion_reserve > 0:
+                payload["completion_reserve_iterations"] = _completion_reserve
+                payload["foreground_iteration_cap"] = _planned_foreground_cap
+                payload["note"] += (
+                    f" {_completion_reserve} parent iteration(s) are reserved "
+                    "for integrating the completion and finishing the original "
+                    "task; keep foreground work bounded and avoid optional "
+                    "scope expansion."
+                )
             _sids = [
                 getattr(_c, "_subagent_id", None) for _c in _child_agents
             ]

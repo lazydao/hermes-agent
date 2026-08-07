@@ -735,6 +735,9 @@ def build_turn_context(
     if iteration_budget is None:
         iteration_budget = getattr(agent, "_next_iteration_budget", None)
     agent._next_iteration_budget = None
+    agent._async_completion_uses_shared_budget = isinstance(
+        iteration_budget, IterationBudget
+    )
     agent.iteration_budget = (
         iteration_budget
         if isinstance(iteration_budget, IterationBudget)

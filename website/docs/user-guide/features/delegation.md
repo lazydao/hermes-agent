@@ -508,6 +508,7 @@ error.
 # In ~/.hermes/config.yaml
 delegation:
   max_iterations: 50                        # Max turns per child (default: 50)
+  continuation_reserve_iterations: 0        # Parent iterations retained for async completion on shared request-budget frontends (currently the messaging gateway; CLI/TUI use fresh completion budgets). 0 disables.
   # max_concurrent_children: 3              # Parallel children per batch (default: 3)
   # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.

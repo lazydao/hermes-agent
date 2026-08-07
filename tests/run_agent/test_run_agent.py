@@ -25,6 +25,7 @@ from agent.codex_responses_adapter import _normalize_codex_response
 import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
+from agent.iteration_budget import _apply_foreground_iteration_cap
 from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
@@ -76,6 +77,22 @@ def agent():
         )
         a.client = MagicMock()
         return a
+
+
+def test_run_conversation_restores_async_completion_foreground_cap(agent):
+    original_cap = agent.max_iterations
+    _apply_foreground_iteration_cap(agent, 70)
+    assert agent.max_iterations == 70
+
+    with patch(
+        "agent.conversation_loop.run_conversation",
+        return_value={"final_response": "ok"},
+    ):
+        result = agent.run_conversation("hello")
+
+    assert result["final_response"] == "ok"
+    assert agent.max_iterations == original_cap
+    assert "_foreground_iteration_cap_original" not in agent.__dict__
 
 
 def test_persist_user_message_override_rewrites_text_turns(agent):
@@ -2157,6 +2174,7 @@ class TestConcurrentToolExecution:
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
+                request_chain_budget=agent.iteration_budget,
             )
             assert result == "result"
 
