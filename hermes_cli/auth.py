@@ -1365,6 +1365,51 @@ def _auth_store_lock(
         yield
 
 
+def _global_credential_pool_providers() -> FrozenSet[str]:
+    """Return providers explicitly configured to share the global pool."""
+    try:
+        sharing = read_raw_config().get("credential_pool_sharing")
+    except Exception:
+        return frozenset()
+    if not isinstance(sharing, dict):
+        return frozenset()
+    return frozenset(
+        str(provider).strip().lower()
+        for provider, mode in sharing.items()
+        if str(provider).strip()
+        and isinstance(mode, str)
+        and mode.strip().lower() == "global"
+    )
+
+
+def credential_pool_is_globally_shared(provider_id: str) -> bool:
+    """Whether *provider_id* uses the default Hermes root credential pool."""
+    normalized = str(provider_id or "").strip().lower()
+    return bool(normalized) and normalized in _global_credential_pool_providers()
+
+
+def credential_pool_store_path(provider_id: str) -> Path:
+    """Resolve the auth.json that owns a provider's credential pool."""
+    if credential_pool_is_globally_shared(provider_id):
+        from hermes_constants import get_default_hermes_root
+
+        return get_default_hermes_root() / "auth.json"
+    return _auth_file_path()
+
+
+@contextmanager
+def credential_pool_store_lock(
+    provider_id: str,
+    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+):
+    """Lock the auth store that owns *provider_id*'s credential pool."""
+    with _auth_store_lock(
+        timeout_seconds=timeout_seconds,
+        target_path=credential_pool_store_path(provider_id),
+    ):
+        yield
+
+
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
@@ -1700,8 +1745,9 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     ``hermes auth add <provider>`` inside the profile, profile entries
     fully shadow global for that provider on the next read.
 
-    Writes always go to the profile (``write_credential_pool`` is unchanged).
-    See issue #18594 follow-up.
+    Writes stay profile-local unless the provider explicitly opts into
+    ``credential_pool_sharing.<provider>: global``. Shared providers use the
+    default Hermes root for both reads and writes.
     """
     auth_store = _load_auth_store()
     pool = auth_store.get("credential_pool")
@@ -1724,7 +1770,30 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
             if isinstance(existing, list) and existing:
                 continue
             merged[gp_key] = list(gp_entries)
+        for shared_provider in _global_credential_pool_providers():
+            shared_store = _load_auth_store(
+                credential_pool_store_path(shared_provider)
+            )
+            shared_pool = shared_store.get("credential_pool")
+            shared_entries = (
+                shared_pool.get(shared_provider)
+                if isinstance(shared_pool, dict)
+                else None
+            )
+            if isinstance(shared_entries, list) and shared_entries:
+                merged[shared_provider] = list(shared_entries)
+            else:
+                merged.pop(shared_provider, None)
         return merged
+
+    provider_id = str(provider_id or "").strip().lower()
+    if credential_pool_is_globally_shared(provider_id):
+        shared_store = _load_auth_store(credential_pool_store_path(provider_id))
+        shared_pool = shared_store.get("credential_pool")
+        shared_entries = (
+            shared_pool.get(provider_id) if isinstance(shared_pool, dict) else None
+        )
+        return list(shared_entries) if isinstance(shared_entries, list) else []
 
     provider_entries = pool.get(provider_id)
     if isinstance(provider_entries, list) and provider_entries:
@@ -1825,9 +1894,11 @@ def write_credential_pool(
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
     """
+    provider_id = str(provider_id or "").strip().lower()
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    target_path = credential_pool_store_path(provider_id)
+    with credential_pool_store_lock(provider_id):
+        auth_store = _load_auth_store(target_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1865,7 +1936,7 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+        return _save_auth_store(auth_store, target_path=target_path)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:

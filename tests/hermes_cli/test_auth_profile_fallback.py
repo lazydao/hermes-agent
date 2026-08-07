@@ -200,6 +200,103 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
 
 
+def test_opted_in_provider_reads_and_writes_global_pool_only(profile_env):
+    """A shared provider bypasses profile shadowing without sharing siblings."""
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    (profile_env["profile"] / "config.yaml").write_text(
+        "credential_pool_sharing:\n  openai-codex: global\n"
+    )
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{
+            "id": "global-codex",
+            "label": "shared",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "manual:device_code",
+            "access_token": "global-access",
+            "refresh_token": "global-refresh",
+        }],
+        "openrouter": [{
+            "id": "global-openrouter",
+            "label": "global-other",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "sk-global",
+        }],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{
+            "id": "stale-profile-codex",
+            "label": "stale",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "manual:device_code",
+            "access_token": "stale-access",
+            "refresh_token": "stale-refresh",
+        }],
+        "openrouter": [{
+            "id": "profile-openrouter",
+            "label": "profile-other",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "sk-profile",
+        }],
+    }))
+
+    assert [
+        entry["id"] for entry in read_credential_pool("openai-codex")
+    ] == ["global-codex"]
+    assert [
+        entry["id"] for entry in read_credential_pool("openrouter")
+    ] == ["profile-openrouter"]
+
+    write_credential_pool("openai-codex", [{
+        "id": "global-codex-new",
+        "label": "shared-new",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "manual:device_code",
+        "access_token": "global-access-new",
+        "refresh_token": "global-refresh-new",
+    }], removed_ids=["global-codex"])
+
+    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
+    profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert [
+        entry["id"]
+        for entry in global_data["credential_pool"]["openai-codex"]
+    ] == ["global-codex-new"]
+    assert [
+        entry["id"]
+        for entry in profile_data["credential_pool"]["openai-codex"]
+    ] == ["stale-profile-codex"]
+    assert [
+        entry["id"] for entry in read_credential_pool("openrouter")
+    ] == ["profile-openrouter"]
+
+
+def test_whole_pool_uses_shared_provider_but_keeps_local_siblings(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    (profile_env["profile"] / "config.yaml").write_text(
+        "credential_pool_sharing:\n  openai-codex: global\n"
+    )
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "global-codex"}],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "profile-codex"}],
+        "openrouter": [{"id": "profile-openrouter"}],
+    }))
+
+    pool = read_credential_pool()
+    assert [entry["id"] for entry in pool["openai-codex"]] == ["global-codex"]
+    assert [entry["id"] for entry in pool["openrouter"]] == ["profile-openrouter"]
+
+
 
 
 def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):

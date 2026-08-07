@@ -134,6 +134,21 @@ credential_pool_strategies:
 | `least_used` | Always pick the key with the lowest request count |
 | `random` | Random selection among healthy keys |
 
+## Opt-in sharing across profiles
+
+Profiles keep credential pools isolated by default. To let selected providers
+share one pool while preserving all other profile state, opt in per provider:
+
+```yaml
+credential_pool_sharing:
+  openai-codex: global
+```
+
+The shared provider reads and writes the pool in the default Hermes root
+`auth.json`. Selection order, cooldown/error state, and OAuth refresh locking
+are coordinated across profiles. Other providers and singleton auth state stay
+profile-local. Every participating profile must enable the same setting.
+
 ## Error Recovery
 
 The pool handles different errors differently:

@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -856,6 +857,49 @@ class CredentialPool:
                 removed_ids=removed_ids,
             )
 
+    def _reload_shared_entries_unlocked(self) -> None:
+        """Refresh this pool from its global store while that store is locked."""
+        if not auth_mod.credential_pool_is_globally_shared(self.provider):
+            return
+        entries = [
+            PooledCredential.from_dict(self.provider, payload)
+            for payload in read_credential_pool(self.provider)
+            if isinstance(payload, dict)
+        ]
+        self._entries = sorted(entries, key=lambda entry: entry.priority)
+        valid_ids = {entry.id for entry in self._entries}
+        if self._current_id not in valid_ids:
+            self._current_id = None
+        self._active_leases = {
+            credential_id: count
+            for credential_id, count in self._active_leases.items()
+            if credential_id in valid_ids
+        }
+
+    @contextmanager
+    def _shared_store_transaction_unlocked(self):
+        """Lock and reload an opted-in global pool for one local mutation."""
+        if not auth_mod.credential_pool_is_globally_shared(self.provider):
+            yield
+            return
+        with auth_mod.credential_pool_store_lock(self.provider):
+            self._reload_shared_entries_unlocked()
+            yield
+
+    def _sync_shared_entry_from_store(
+        self, entry: PooledCredential
+    ) -> PooledCredential:
+        """Adopt the latest shared-pool token and status for one entry."""
+        if not auth_mod.credential_pool_is_globally_shared(self.provider):
+            return entry
+        for payload in read_credential_pool(self.provider):
+            if not isinstance(payload, dict) or payload.get("id") != entry.id:
+                continue
+            updated = PooledCredential.from_dict(self.provider, payload)
+            self._replace_entry(entry, updated)
+            return updated
+        return entry
+
     def _is_terminal_auth_failure(
         self,
         status_code: Optional[int],
@@ -1471,16 +1515,29 @@ class CredentialPool:
         # there was no recovery path at all, so the loser was marked
         # exhausted despite a valid token existing on disk from the winner.
         if self.provider in ("openai-codex", "xai-oauth", "anthropic"):
-            sync_entry = (
-                self._sync_codex_entry_from_auth_store
-                if self.provider == "openai-codex"
-                else self._sync_xai_oauth_entry_from_pool_store
-                if self.provider == "xai-oauth"
-                else self._sync_anthropic_entry_from_pool_store
-            )
-            with _auth_store_lock(
-                timeout_seconds=self._single_use_refresh_lock_timeout()
-            ):
+            shared = auth_mod.credential_pool_is_globally_shared(self.provider)
+            if shared:
+                sync_entry = (
+                    self._sync_anthropic_entry_from_pool_store
+                    if self.provider == "anthropic"
+                    else self._sync_shared_entry_from_store
+                )
+                lock_context = auth_mod.credential_pool_store_lock(
+                    self.provider,
+                    timeout_seconds=self._single_use_refresh_lock_timeout(),
+                )
+            else:
+                sync_entry = (
+                    self._sync_codex_entry_from_auth_store
+                    if self.provider == "openai-codex"
+                    else self._sync_xai_oauth_entry_from_pool_store
+                    if self.provider == "xai-oauth"
+                    else self._sync_anthropic_entry_from_pool_store
+                )
+                lock_context = _auth_store_lock(
+                    timeout_seconds=self._single_use_refresh_lock_timeout()
+                )
+            with lock_context:
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
                     if synced is not entry:
@@ -1713,7 +1770,11 @@ class CredentialPool:
                 # refresh_token — single-use tokens consumed by another Hermes
                 # process sharing the same auth.json singleton would otherwise
                 # trigger ``refresh_token_reused`` on the next POST.
-                synced = self._sync_codex_entry_from_auth_store(entry)
+                synced = (
+                    self._sync_shared_entry_from_store(entry)
+                    if auth_mod.credential_pool_is_globally_shared(self.provider)
+                    else self._sync_codex_entry_from_auth_store(entry)
+                )
                 if synced is not entry:
                     entry = synced
                 refreshed = auth_mod.refresh_codex_oauth_pure(
@@ -1732,7 +1793,11 @@ class CredentialPool:
                 # process (or another profile sharing the singleton) would
                 # otherwise trigger ``refresh_token_reused`` on the next
                 # POST.  Only meaningful for singleton-seeded entries.
-                synced = self._sync_xai_oauth_entry_from_auth_store(entry)
+                synced = (
+                    self._sync_shared_entry_from_store(entry)
+                    if auth_mod.credential_pool_is_globally_shared(self.provider)
+                    else self._sync_xai_oauth_entry_from_auth_store(entry)
+                )
                 if synced is not entry:
                     entry = synced
                 refreshed = auth_mod.refresh_xai_oauth_pure(
@@ -1836,7 +1901,11 @@ class CredentialPool:
             # (device_code) entries; manual entries don't share
             # state with the singleton.
             if self.provider == "xai-oauth":
-                synced = self._sync_xai_oauth_entry_from_auth_store(entry)
+                synced = (
+                    self._sync_shared_entry_from_store(entry)
+                    if auth_mod.credential_pool_is_globally_shared(self.provider)
+                    else self._sync_xai_oauth_entry_from_auth_store(entry)
+                )
                 if synced.refresh_token != entry.refresh_token:
                     logger.debug(
                         "xAI OAuth refresh failed but auth.json has newer tokens — adopting"
@@ -1911,7 +1980,11 @@ class CredentialPool:
             # and the HTTP call.  Re-check auth.json and adopt the fresh tokens
             # if they have rotated since.
             if self.provider == "openai-codex":
-                synced = self._sync_codex_entry_from_auth_store(entry)
+                synced = (
+                    self._sync_shared_entry_from_store(entry)
+                    if auth_mod.credential_pool_is_globally_shared(self.provider)
+                    else self._sync_codex_entry_from_auth_store(entry)
+                )
                 if synced.refresh_token != entry.refresh_token:
                     logger.debug(
                         "Codex OAuth refresh failed but auth.json has newer tokens — adopting"
@@ -1934,6 +2007,28 @@ class CredentialPool:
                 # remove all singleton-seeded (device_code) entries from the
                 # in-memory pool.  Mirrors the xAI and Nous quarantine paths.
                 if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
+                    if entry.source != "device_code":
+                        logger.warning(
+                            "Codex OAuth refresh token is terminally invalid; "
+                            "marking manual credential %s DEAD",
+                            entry.label or entry.id[:8],
+                        )
+                        updated = replace(
+                            entry,
+                            last_status=STATUS_DEAD,
+                            last_status_at=time.time(),
+                            last_error_code=401,
+                            last_error_reason=str(
+                                getattr(exc, "code", "invalid_grant")
+                            ),
+                            last_error_message=str(exc),
+                            last_error_reset_at=None,
+                        )
+                        self._replace_entry(entry, updated)
+                        self._persist()
+                        if self._current_id == entry.id:
+                            self._current_id = None
+                        return None
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
@@ -2149,7 +2244,8 @@ class CredentialPool:
     def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[tuple]]:
         """Run selection under the lock, returning entry + pending refreshes."""
         with self._lock:
-            return self._select_unlocked()
+            with self._shared_store_transaction_unlocked():
+                return self._select_unlocked()
 
     def _refresh_pending_entries(self, pending: List[tuple]) -> None:
         """Refresh deferred single-use-token entries outside the lock.
@@ -2411,6 +2507,60 @@ class CredentialPool:
         failure_reason: Optional[str] = None,
     ) -> Optional[PooledCredential]:
         with self._lock:
+            failed_entry_id = credential_id
+            if failed_entry_id is None and api_key_hint:
+                failed_entry = next(
+                    (
+                        entry
+                        for entry in self._entries
+                        if entry.runtime_api_key == api_key_hint
+                    ),
+                    None,
+                )
+                failed_entry_id = (
+                    failed_entry.id if failed_entry is not None else None
+                )
+            if failed_entry_id is None:
+                failed_entry_id = self._current_id
+
+            shared = auth_mod.credential_pool_is_globally_shared(self.provider)
+            with self._shared_store_transaction_unlocked():
+                if shared and api_key_hint and failed_entry_id:
+                    latest_entry = next(
+                        (
+                            entry
+                            for entry in self._entries
+                            if entry.id == failed_entry_id
+                        ),
+                        None,
+                    )
+                    if (
+                        latest_entry is not None
+                        and latest_entry.runtime_api_key != api_key_hint
+                    ):
+                        logger.info(
+                            "credential pool: failed request used a stale shared "
+                            "credential; adopting refreshed entry %s",
+                            latest_entry.label or latest_entry.id[:8],
+                        )
+                        self._current_id = latest_entry.id
+                        return latest_entry
+                return self._mark_exhausted_and_rotate_unlocked(
+                    status_code=status_code,
+                    error_context=error_context,
+                    api_key_hint=api_key_hint,
+                    credential_id=credential_id,
+                )
+
+    def _mark_exhausted_and_rotate_unlocked(
+        self,
+        *,
+        status_code: Optional[int],
+        error_context: Optional[Dict[str, Any]] = None,
+        api_key_hint: Optional[str] = None,
+        credential_id: Optional[str] = None,
+    ) -> Optional[PooledCredential]:
+        with self._lock:
             entry = None
             identity_supplied = bool(credential_id or api_key_hint)
             if credential_id:
@@ -2597,27 +2747,28 @@ class CredentialPool:
     ) -> Tuple[Optional[str], List[tuple]]:
         """Run lease acquisition under the lock, returning id + pending refreshes."""
         with self._lock:
-            if credential_id:
-                self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
-                self._current_id = credential_id
-                return credential_id, []
+            with self._shared_store_transaction_unlocked():
+                if credential_id:
+                    self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
+                    self._current_id = credential_id
+                    return credential_id, []
 
-            available, pending_refresh = self._available_entries(clear_expired=True, refresh=True)
-            if not available:
-                return None, pending_refresh
+                available, pending_refresh = self._available_entries(clear_expired=True, refresh=True)
+                if not available:
+                    return None, pending_refresh
 
-            below_cap = [
-                entry for entry in available
-                if self._active_leases.get(entry.id, 0) < self._max_concurrent
-            ]
-            candidates = below_cap if below_cap else available
-            chosen = min(
-                candidates,
-                key=lambda entry: (self._active_leases.get(entry.id, 0), entry.priority),
-            )
-            self._active_leases[chosen.id] = self._active_leases.get(chosen.id, 0) + 1
-            self._current_id = chosen.id
-            return chosen.id, pending_refresh
+                below_cap = [
+                    entry for entry in available
+                    if self._active_leases.get(entry.id, 0) < self._max_concurrent
+                ]
+                candidates = below_cap if below_cap else available
+                chosen = min(
+                    candidates,
+                    key=lambda entry: (self._active_leases.get(entry.id, 0), entry.priority),
+                )
+                self._active_leases[chosen.id] = self._active_leases.get(chosen.id, 0) + 1
+                self._current_id = chosen.id
+                return chosen.id, pending_refresh
 
     def release_lease(self, credential_id: str) -> None:
         """Release a previously acquired credential lease."""
@@ -2686,46 +2837,59 @@ class CredentialPool:
 
     def reset_statuses(self) -> int:
         with self._lock:
-            count = 0
-            new_entries = []
-            for entry in self._entries:
-                if entry.last_status or entry.last_status_at or entry.last_error_code:
-                    new_entries.append(
-                        replace(
-                            entry,
-                            last_status=None,
-                            last_status_at=None,
-                            last_error_code=None,
-                            last_error_reason=None,
-                            last_error_message=None,
-                            last_error_reset_at=None,
+            with self._shared_store_transaction_unlocked():
+                count = 0
+                new_entries = []
+                for entry in self._entries:
+                    if entry.last_status or entry.last_status_at or entry.last_error_code:
+                        new_entries.append(
+                            replace(
+                                entry,
+                                last_status=None,
+                                last_status_at=None,
+                                last_error_code=None,
+                                last_error_reason=None,
+                                last_error_message=None,
+                                last_error_reset_at=None,
+                            )
                         )
-                    )
-                    count += 1
-                else:
-                    new_entries.append(entry)
-            if count:
-                self._entries = new_entries
-                self._persist()
-            return count
+                        count += 1
+                    else:
+                        new_entries.append(entry)
+                if count:
+                    self._entries = new_entries
+                    self._persist()
+                return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
         with self._lock:
             if index < 1 or index > len(self._entries):
                 return None
-            removed = self._entries.pop(index - 1)
-            self._entries = [
-                replace(entry, priority=new_priority)
-                for new_priority, entry in enumerate(self._entries)
-            ]
-            write_credential_pool(
-                self.provider,
-                [entry.to_dict() for entry in self._entries],
-                removed_ids=[removed.id],
-            )
-            if self._current_id == removed.id:
-                self._current_id = None
-            return removed
+            target_id = self._entries[index - 1].id
+            with self._shared_store_transaction_unlocked():
+                current_index = next(
+                    (
+                        candidate_index
+                        for candidate_index, entry in enumerate(self._entries)
+                        if entry.id == target_id
+                    ),
+                    None,
+                )
+                if current_index is None:
+                    return None
+                removed = self._entries.pop(current_index)
+                self._entries = [
+                    replace(entry, priority=new_priority)
+                    for new_priority, entry in enumerate(self._entries)
+                ]
+                write_credential_pool(
+                    self.provider,
+                    [entry.to_dict() for entry in self._entries],
+                    removed_ids=[removed.id],
+                )
+                if self._current_id == removed.id:
+                    self._current_id = None
+                return removed
 
     def resolve_target(self, target: Any) -> Tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
         raw = str(target or "").strip()
@@ -2755,10 +2919,11 @@ class CredentialPool:
 
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
         with self._lock:
-            entry = replace(entry, priority=_next_priority(self._entries))
-            self._entries.append(entry)
-            self._persist()
-            return entry
+            with self._shared_store_transaction_unlocked():
+                entry = replace(entry, priority=_next_priority(self._entries))
+                self._entries.append(entry)
+                self._persist()
+                return entry
 
 
 def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, payload: Dict[str, Any]) -> bool:
