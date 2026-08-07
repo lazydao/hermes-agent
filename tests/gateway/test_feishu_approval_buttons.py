@@ -236,6 +236,32 @@ class TestResolveApproval:
         mock_resolve.assert_not_called()
         assert 5 in adapter._approval_state
 
+    @pytest.mark.asyncio
+    async def test_group_open_rule_does_not_bypass_operator_allowlist(self):
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"ou_owner"}
+        adapter._group_rules["oc_open"] = feishu_module.FeishuGroupRule(
+            policy="open",
+            require_mention=True,
+        )
+        adapter._approval_state[7] = {
+            "session_key": "sess-7",
+            "message_id": "msg_007",
+            "chat_id": "oc_open",
+        }
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._resolve_approval(
+                7,
+                "session",
+                "Group Member",
+                open_id="ou_member",
+                chat_id="oc_open",
+            )
+
+        mock_resolve.assert_not_called()
+        assert 7 in adapter._approval_state
+
 
 # ===========================================================================
 # _handle_card_action_event — non-approval card actions
@@ -662,5 +688,3 @@ class TestResolveUpdatePrompt:
 
         assert not (tmp_path / ".hermes" / ".update_response").exists()
         assert 3 in adapter._update_prompt_state
-
-
