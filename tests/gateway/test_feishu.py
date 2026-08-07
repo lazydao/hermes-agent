@@ -2465,4 +2465,3 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-
