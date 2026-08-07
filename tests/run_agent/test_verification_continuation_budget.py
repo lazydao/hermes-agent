@@ -105,6 +105,75 @@ def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch
     assert not result["messages"][1].get("_pre_verify_synthetic")
 
 
+def test_pre_response_guard_uses_safe_fallback_at_budget_limit(agent, monkeypatch):
+    agent._interruptible_api_call = lambda _kwargs: _response("premature confirmation")
+    agent._handle_max_iterations = MagicMock(return_value="unsafe summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch(
+            "hermes_cli.plugins.has_hook",
+            side_effect=lambda name: name == "pre_response",
+        ),
+        patch(
+            "hermes_cli.plugins.get_pre_response_directive",
+            return_value={
+                "action": "continue",
+                "message": "persist the correction first",
+                "fallback": "The correction was not persisted, so it is not confirmed.",
+            },
+        ),
+        patch("agent.response_hooks.max_pre_response_nudges", return_value=2),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation(
+            "record this",
+            platform_message_id="platform-message-123",
+        )
+
+    assert result["final_response"] == (
+        "The correction was not persisted, so it is not confirmed."
+    )
+    assert result["completed"] is False
+    assert agent._handle_max_iterations.call_count == 0
+    assert result["messages"][1]["_pre_response_synthetic"] is True
+    assert result["messages"][2]["_pre_response_synthetic"] is True
+
+
+def test_pre_response_guard_allows_later_verified_response(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    answers = iter(
+        [_response("premature confirmation"), _response("verified confirmation")]
+    )
+    agent._interruptible_api_call = lambda _kwargs: next(answers)
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch(
+            "hermes_cli.plugins.has_hook",
+            side_effect=lambda name: name == "pre_response",
+        ),
+        patch(
+            "hermes_cli.plugins.get_pre_response_directive",
+            side_effect=[
+                {
+                    "action": "continue",
+                    "message": "persist the correction first",
+                    "fallback": "not persisted",
+                },
+                None,
+            ],
+        ),
+        patch("agent.response_hooks.max_pre_response_nudges", return_value=2),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("record this")
+
+    assert result["final_response"] == "verified confirmation"
+    assert result["completed"] is True
+
+
 def test_intermediate_ack_uses_summary_instead_of_premature_text(agent, monkeypatch):
     agent.valid_tool_names = ["web_search"]
     agent._intent_ack_continuation = True

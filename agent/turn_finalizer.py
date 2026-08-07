@@ -143,6 +143,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    _pending_pre_response_fallback=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -166,10 +167,24 @@ def finalize_turn(
         and bool(_pending_verification_response)
         and budget_fallback_eligible
     )
+    response_guard_budget_exhausted = (
+        final_response is None
+        and bool(_pending_pre_response_fallback)
+        and budget_fallback_eligible
+    )
 
     iteration_limit_fallback = False
     preserved_verification_fallback = False
-    if continuation_budget_exhausted:
+    if response_guard_budget_exhausted:
+        # A pre_response guard withheld the model answer and then exhausted the
+        # remaining model budget. Its fallback is explicitly safe to deliver;
+        # never resurrect the response that failed the gate.
+        final_response = _pending_pre_response_fallback
+        _turn_exit_reason = (
+            f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        )
+        iteration_limit_fallback = True
+    elif continuation_budget_exhausted:
         # A verification/continuation gate deliberately withheld a composed
         # answer, then consumed the remaining budget before producing a newer
         # one. Preserve that exact answer instead of replacing it with another

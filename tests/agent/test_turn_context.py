@@ -260,6 +260,22 @@ def test_user_message_preserves_platform_event_timestamp():
     assert ctx.messages[-1]["timestamp"] == 123.5
 
 
+def test_platform_message_id_reaches_persistence_and_pre_llm_hook():
+    agent = _FakeAgent()
+    seen = {}
+
+    def capture(hook_name, **kwargs):
+        if hook_name == "pre_llm_call":
+            seen.update(kwargs)
+        return []
+
+    with patch("hermes_cli.plugins.invoke_hook", side_effect=capture):
+        _build(agent, platform_message_id="platform-message-123")
+
+    assert agent._persist_user_platform_message_id == "platform-message-123"
+    assert seen["platform_message_id"] == "platform-message-123"
+
+
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
 #
 # The prologue is the ONLY place the per-turn synchronous

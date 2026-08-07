@@ -189,6 +189,12 @@ VALID_HOOKS: Set[str] = {
     # verification-stop nudge; this hook is for user/plugin policy and is
     # bounded by agent.max_verify_nudges.
     "pre_verify",
+    # Final-response gate. Fired after the model composes a text response but
+    # before that response is committed or returned. A callback may request a
+    # bounded continuation or replace an unsafe/premature response:
+    #   {"action": "continue", "message": "...", "fallback": "..."}
+    #   {"action": "replace", "message": "..."}
+    "pre_response",
     "pre_api_request",
     "post_api_request",
     "api_request_error",
@@ -7025,6 +7031,56 @@ def get_plugin_error_classification(
             skipped_valid,
         )
     return winner
+
+
+def get_pre_response_directive(
+    *,
+    session_id: str = "",
+    task_id: str = "",
+    turn_id: str = "",
+    platform: str = "",
+    model: str = "",
+    attempt: int = 0,
+    user_message: Any = "",
+    platform_message_id: str = "",
+    final_response: str = "",
+) -> Optional[Dict[str, str]]:
+    """Return the first actionable ``pre_response`` hook directive.
+
+    ``continue`` withholds the composed response and adds an internal follow-up
+    instruction for another model iteration. ``replace`` returns the supplied
+    message instead. A continue directive may include a user-safe ``fallback``
+    used if the iteration budget is exhausted before the gate passes.
+    """
+    hook_results = invoke_hook(
+        "pre_response",
+        session_id=session_id,
+        task_id=task_id,
+        turn_id=turn_id,
+        platform=platform,
+        model=model,
+        attempt=attempt,
+        user_message=user_message,
+        platform_message_id=platform_message_id,
+        final_response=final_response,
+    )
+
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        action = str(result.get("action") or "").strip().lower()
+        if action not in {"continue", "replace"}:
+            continue
+        message = result.get("message")
+        if not isinstance(message, str) or not message.strip():
+            continue
+        directive = {"action": action, "message": message.strip()}
+        fallback = result.get("fallback")
+        if isinstance(fallback, str) and fallback.strip():
+            directive["fallback"] = fallback.strip()
+        return directive
+
+    return None
 
 
 def _ensure_plugins_discovered(force: bool = False) -> PluginManager:

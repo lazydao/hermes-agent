@@ -20,6 +20,7 @@ from hermes_cli.plugins import (
     _dispatch_pre_tool_call_hooks,
     get_plugin_command_handler,
     get_plugin_commands,
+    get_pre_response_directive,
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,
     has_middleware,
@@ -782,6 +783,9 @@ class TestPluginLoading:
 class TestPluginHooks:
     """Tests for lifecycle hook registration and invocation."""
 
+    def test_valid_hooks_include_pre_response(self):
+        assert "pre_response" in VALID_HOOKS
+
 
 
     def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
@@ -1506,6 +1510,48 @@ class TestGetPreVerifyContinueMessage:
         assert seen["coding"] is True
         assert seen["attempt"] == 2
         assert seen["changed_paths"] == ["a.py"]
+
+
+class TestGetPreResponseDirective:
+    def test_continue_forwards_turn_and_platform_message_id(self, monkeypatch):
+        seen = {}
+
+        def capture(hook_name, **kwargs):
+            seen.update(kwargs)
+            return [
+                {
+                    "action": "continue",
+                    "message": "persist it first",
+                    "fallback": "not persisted",
+                }
+            ]
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+
+        assert get_pre_response_directive(
+            turn_id="turn-1",
+            platform_message_id="message-1",
+        ) == {
+            "action": "continue",
+            "message": "persist it first",
+            "fallback": "not persisted",
+        }
+        assert seen["turn_id"] == "turn-1"
+        assert seen["platform_message_id"] == "message-1"
+
+    def test_replace_requires_nonempty_message(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "replace", "message": "   "},
+                {"action": "replace", "message": "safe response"},
+            ],
+        )
+
+        assert get_pre_response_directive() == {
+            "action": "replace",
+            "message": "safe response",
+        }
 
 
 class TestThreadToolWhitelist:

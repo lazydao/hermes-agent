@@ -1908,6 +1908,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    platform_message_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1932,7 +1933,8 @@ def run_conversation(
             the message unchanged.
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
-                or queuing follow-up prefetch work.
+        platform_message_id: Optional messaging-platform identifier to store
+            on the persisted user row and expose to per-turn plugin hooks.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -1982,6 +1984,7 @@ def run_conversation(
         stream_callback,
         persist_user_message,
         persist_user_timestamp,
+        platform_message_id,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
@@ -2062,6 +2065,10 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
+    # User-safe fallback supplied by a pre_response guard. Unlike verification
+    # fallbacks, this must never preserve the model's withheld response because
+    # the guard explicitly judged that response unsafe to deliver.
+    _pending_pre_response_fallback = None
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -8620,6 +8627,87 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # Final-response policy gate. Unlike pre_verify, this runs for
+                # any composed response and lets an edge plugin enforce a
+                # durable side-effect or other invariant before the response is
+                # visible. Continuations are bounded; replacements remain
+                # available after the bound so the hook can fail closed.
+                _response_directive = None
+                _response_attempt = getattr(agent, "_pre_response_nudges", 0)
+                try:
+                    from agent.response_hooks import max_pre_response_nudges
+                    from hermes_cli.plugins import (
+                        get_pre_response_directive,
+                        has_hook,
+                    )
+
+                    if has_hook("pre_response"):
+                        _response_directive = get_pre_response_directive(
+                            session_id=getattr(agent, "session_id", None) or "",
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            platform=getattr(agent, "platform", "") or "",
+                            model=getattr(agent, "model", "") or "",
+                            attempt=_response_attempt,
+                            user_message=original_user_message,
+                            platform_message_id=(
+                                getattr(
+                                    agent,
+                                    "_persist_user_platform_message_id",
+                                    None,
+                                )
+                                or ""
+                            ),
+                            final_response=final_response,
+                        )
+                    _max_response_nudges = max_pre_response_nudges()
+                except Exception:
+                    logger.debug("pre_response hook check failed", exc_info=True)
+                    _response_directive = None
+                    _max_response_nudges = 0
+
+                if _response_directive:
+                    _response_action = _response_directive["action"]
+                    _response_message = _response_directive["message"]
+                    _response_fallback = _response_directive.get(
+                        "fallback",
+                        "I could not complete the required response checks, so "
+                        "I have not confirmed completion.",
+                    )
+                    if (
+                        _response_action == "continue"
+                        and _response_attempt < _max_response_nudges
+                    ):
+                        agent._pre_response_nudges = _response_attempt + 1
+                        final_msg["finish_reason"] = "response_hook_continue"
+                        final_msg["_pre_response_synthetic"] = True
+                        append_message(messages, final_msg)
+                        append_message(
+                            messages,
+                            {
+                                "role": "user",
+                                "content": _response_message,
+                                "_pre_response_synthetic": True,
+                            }
+                        )
+                        agent._session_messages = messages
+                        logger.debug(
+                            "pre_response nudge issued (attempt %d)",
+                            agent._pre_response_nudges,
+                        )
+                        _pending_pre_response_fallback = _response_fallback
+                        final_response = None
+                        continue
+
+                    if _response_action == "continue":
+                        # The continuation budget is exhausted. Deliver the
+                        # hook's safe fallback rather than the model response
+                        # that failed the gate.
+                        _response_message = _response_fallback
+                    final_response = _response_message
+                    final_msg["content"] = _response_message
+                    final_msg["finish_reason"] = "response_hook_replace"
+
                 append_message(messages, final_msg)
                 # Make the completed answer durable before leaving the loop —
                 # a session torn down before finalize_turn's _persist_session
@@ -8823,6 +8911,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        _pending_pre_response_fallback=_pending_pre_response_fallback,
     )
 
 

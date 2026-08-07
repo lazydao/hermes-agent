@@ -166,6 +166,17 @@ _DEFAULT_PAYLOADS = {
         "final_response": "All done — the change is applied.",
         "changed_paths": ["src/app.tsx"],
     },
+    "pre_response": {
+        "session_id": "test-session",
+        "task_id": "test-task",
+        "turn_id": "test-session:test-task:test-turn",
+        "platform": "cli",
+        "model": "gpt-4",
+        "attempt": 0,
+        "user_message": "Apply the confirmed correction.",
+        "platform_message_id": "message-123",
+        "final_response": "The correction is recorded.",
+    },
     "on_session_start": {"session_id": "test-session"},
     "on_session_end": {
         "session_id": "test-session",

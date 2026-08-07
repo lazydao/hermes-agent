@@ -6947,6 +6947,10 @@ class TurnRunner:
                 "conversation_history": agent_history,
                 "task_id": ctx.session_id,
             }
+            if ctx.event_message_id:
+                _conversation_kwargs["platform_message_id"] = str(
+                    ctx.event_message_id
+                )
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
