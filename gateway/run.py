@@ -3638,6 +3638,21 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     return adapter.get_pending_message(session_key)
 
 
+def _should_defer_internal_iteration_limit_response(
+    result: dict | None,
+    pending_event: MessageEvent | None,
+) -> bool:
+    """Hold an iteration-limit interim answer while an internal continuation runs."""
+    if (
+        not isinstance(result, dict)
+        or pending_event is None
+        or not bool(getattr(pending_event, "internal", False))
+    ):
+        return False
+    exit_reason = str(result.get("turn_exit_reason") or "")
+    return exit_reason.startswith("max_iterations_reached(")
+
+
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
@@ -31577,9 +31592,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     except Exception:
                         _intentional_silence = False
+                    _defer_internal_limit_response = (
+                        _should_defer_internal_iteration_limit_response(
+                            result,
+                            pending_event,
+                        )
+                    )
                     if _intentional_silence:
                         logger.info(
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
+                            session_key or "?",
+                        )
+                    elif _defer_internal_limit_response:
+                        logger.info(
+                            "Queued internal follow-up for session %s: deferring "
+                            "iteration-limit response until the continuation completes.",
                             session_key or "?",
                         )
                     elif first_response:
