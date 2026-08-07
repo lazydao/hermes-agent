@@ -134,6 +134,88 @@ def test_get_session_env_falls_back_to_os_environ(monkeypatch):
     assert get_session_env("HERMES_SESSION_PLATFORM") == ""
 
 
+@pytest.mark.asyncio
+async def test_run_agent_binds_and_restores_current_platform_message_id(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="dm",
+        user_id="ou_user",
+    )
+    observed = []
+
+    async def fake_run_agent_inner(*args, **kwargs):
+        observed.append(get_session_env("HERMES_SESSION_MESSAGE_ID"))
+        return {"final_response": "ok"}
+
+    monkeypatch.setattr(runner, "_run_agent_inner", fake_run_agent_inner)
+    tokens = set_session_vars(message_id="outer-message")
+    try:
+        await runner._run_agent(
+            "first",
+            "",
+            [],
+            source,
+            "session-1",
+            event_message_id="reply-anchor",
+            platform_message_id="om_first",
+        )
+        assert get_session_env("HERMES_SESSION_MESSAGE_ID") == "outer-message"
+
+        await runner._run_agent(
+            "second",
+            "",
+            [],
+            source,
+            "session-1",
+            event_message_id="om_fallback",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert observed == ["om_first", "om_fallback"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_run_agent_message_ids_are_isolated(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="dm",
+        user_id="ou_user",
+    )
+    both_entered = asyncio.Event()
+    entered = 0
+    observed = {}
+
+    async def fake_run_agent_inner(message, *args, **kwargs):
+        nonlocal entered
+        observed[message] = [get_session_env("HERMES_SESSION_MESSAGE_ID")]
+        entered += 1
+        if entered == 2:
+            both_entered.set()
+        await asyncio.wait_for(both_entered.wait(), timeout=1)
+        observed[message].append(get_session_env("HERMES_SESSION_MESSAGE_ID"))
+        return {"final_response": "ok"}
+
+    monkeypatch.setattr(runner, "_run_agent_inner", fake_run_agent_inner)
+    await asyncio.gather(
+        runner._run_agent(
+            "first", "", [], source, "session-1", platform_message_id="om_first"
+        ),
+        runner._run_agent(
+            "second", "", [], source, "session-2", platform_message_id="om_second"
+        ),
+    )
+
+    assert observed == {
+        "first": ["om_first", "om_first"],
+        "second": ["om_second", "om_second"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # SESSION_KEY contextvars tests
 # ---------------------------------------------------------------------------
@@ -272,4 +354,3 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
 
     reset_session_vars()
     assert get_session_env("HERMES_CRON_SESSION") == "1"
-
