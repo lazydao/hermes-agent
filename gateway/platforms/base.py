@@ -6807,6 +6807,7 @@ class BasePlatformAdapter(ABC):
                                     adapter_profile=getattr(
                                         delivery_adapter, "_owner_profile", None
                                     ),
+                                    reply_to_message_id=_reply_anchor,
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:
