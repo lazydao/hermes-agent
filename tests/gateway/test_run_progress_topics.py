@@ -1042,6 +1042,23 @@ class QueuedFailedEmptyAgent:
         }
 
 
+class QueuedProcessCompletionAgent:
+    """Count whether a queued process completion starts another model turn."""
+
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        return {
+            "final_response": f"final response {type(self).calls}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class QueuedIterationLimitAgent:
     """First turn hits its cap; the queued event completes the same task."""
 
@@ -1113,6 +1130,9 @@ async def _run_with_agent(
     session_id,
     pending_text=None,
     pending_internal=False,
+    pending_message_id="queued-1",
+    pending_metadata=None,
+    platform_message_id=None,
     config_data=None,
     platform=Platform.TELEGRAM,
     chat_id="-1001",
@@ -1158,8 +1178,9 @@ async def _run_with_agent(
             text=pending_text,
             message_type=MessageType.TEXT,
             source=source,
-            message_id="queued-1",
+            message_id=pending_message_id,
             internal=pending_internal,
+            metadata=pending_metadata or {},
         )
 
     result = await runner._run_agent(
@@ -1169,6 +1190,7 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        platform_message_id=platform_message_id,
     )
     return adapter, result
 
@@ -1245,6 +1267,63 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
     assert adapter.edits[-1]["content"].endswith("web_search - beta - error")
     assert "web_search - alpha - complete" in adapter.edits[-1]["content"]
     assert adapter.native_stops == 1
+
+
+@pytest.mark.asyncio
+async def test_run_agent_suppresses_same_turn_polled_process_completion(
+    monkeypatch, tmp_path,
+):
+    from tools.process_registry import process_registry
+
+    process_id = "proc_same_turn_polled"
+    message_id = "origin-message-1"
+    QueuedProcessCompletionAgent.calls = 0
+    process_registry._poll_observed.add(process_id)
+    try:
+        _, result = await _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            QueuedProcessCompletionAgent,
+            session_id="sess-same-turn-process-completion",
+            pending_text="[SYSTEM: Background process completed]",
+            pending_internal=True,
+            pending_message_id=message_id,
+            pending_metadata={
+                "background_process_completion_session_id": process_id,
+            },
+            platform_message_id=message_id,
+        )
+    finally:
+        process_registry._poll_observed.discard(process_id)
+
+    assert QueuedProcessCompletionAgent.calls == 1
+    assert result["final_response"] == "final response 1"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_keeps_unobserved_process_completion_followup(
+    monkeypatch, tmp_path,
+):
+    process_id = "proc_not_polled"
+    message_id = "origin-message-2"
+    QueuedProcessCompletionAgent.calls = 0
+
+    _, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedProcessCompletionAgent,
+        session_id="sess-unobserved-process-completion",
+        pending_text="[SYSTEM: Background process completed]",
+        pending_internal=True,
+        pending_message_id=message_id,
+        pending_metadata={
+            "background_process_completion_session_id": process_id,
+        },
+        platform_message_id=message_id,
+    )
+
+    assert QueuedProcessCompletionAgent.calls == 2
+    assert result["final_response"] == "final response 2"
 
 
 @pytest.mark.asyncio

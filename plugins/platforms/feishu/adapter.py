@@ -222,6 +222,7 @@ _FEISHU_DOC_UPLOAD_TYPES = {
 _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
+_STALE_THREAD_FALLBACK_NOTICE = "原话题已失效，回复转发至群聊"
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
@@ -1336,6 +1337,7 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
 
     original_connect = ws_client_module.websockets.connect
     original_configure = getattr(ws_client, "_configure", None)
+    original_receive_message_loop = getattr(ws_client, "_receive_message_loop", None)
 
     def _apply_runtime_ws_overrides() -> None:
         try:
@@ -1360,18 +1362,38 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         _apply_runtime_ws_overrides()
         return result
 
+    async def _tracked_receive_message_loop() -> Any:
+        """Keep the SDK receive task reachable for ordered shutdown."""
+        current_task = asyncio.current_task()
+        adapter._ws_receive_task = current_task
+        try:
+            return await original_receive_message_loop()
+        finally:
+            if adapter._ws_receive_task is current_task:
+                adapter._ws_receive_task = None
+
     ws_client_module.websockets.connect = _connect_with_overrides
     if original_configure is not None:
         setattr(ws_client, "_configure", _configure_with_overrides)
+    if callable(original_receive_message_loop):
+        setattr(ws_client, "_receive_message_loop", _tracked_receive_message_loop)
     _apply_runtime_ws_overrides()
     try:
         ws_client.start()
+    except asyncio.CancelledError:
+        if getattr(adapter, "_running", False):
+            logger.error("[Feishu] Websocket client cancelled while adapter was running")
+            raise
+        logger.debug("[Feishu] Websocket client cancelled during shutdown")
     except Exception:
-        pass
+        logger.exception("[Feishu] Websocket client exited unexpectedly")
+        raise
     finally:
         ws_client_module.websockets.connect = original_connect
         if original_configure is not None:
             setattr(ws_client, "_configure", original_configure)
+        if callable(original_receive_message_loop):
+            setattr(ws_client, "_receive_message_loop", original_receive_message_loop)
         pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
         for task in pending:
             task.cancel()
@@ -1385,6 +1407,7 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
             loop.close()
         except Exception:
             pass
+        adapter._ws_receive_task = None
         adapter._ws_thread_loop = None
 
 
@@ -1526,6 +1549,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_client: Optional[Any] = None
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ws_receive_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._webhook_runner: Optional[Any] = None
         self._webhook_site: Optional[Any] = None
@@ -1862,8 +1886,20 @@ class FeishuAdapter(BasePlatformAdapter):
             and hasattr(ws_client, "_disconnect")
         ):
             try:
+                async def close_websocket() -> None:
+                    # lark-oapi treats the normal 1000/OK close raised from
+                    # recv() as an error when auto-reconnect is disabled. Stop
+                    # and retrieve its receive task before closing the socket
+                    # so an intentional gateway shutdown stays quiet while
+                    # unrelated websocket failures still surface normally.
+                    receive_task = self._ws_receive_task
+                    if receive_task is not None and not receive_task.done():
+                        receive_task.cancel()
+                        await asyncio.gather(receive_task, return_exceptions=True)
+                    await ws_client._disconnect()
+
                 future = asyncio.run_coroutine_threadsafe(
-                    ws_client._disconnect(), ws_thread_loop
+                    close_websocket(), ws_thread_loop
                 )
                 # 5s is generous — the CLOSE frame is a single WebSocket
                 # control frame. If it takes longer than that the
@@ -1956,6 +1992,93 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound — send / edit / send_image / send_voice / …
     # =========================================================================
 
+    async def _recover_stale_thread_send(
+        self,
+        *,
+        response: Any,
+        chat_id: str,
+        chunk: str,
+        msg_type: str,
+        payload: str,
+        chunk_at_ref: Optional["FeishuMentionRef"],
+        metadata: Optional[Dict[str, Any]],
+    ) -> tuple[Any, Optional[str], bool]:
+        """Recover Feishu's stale-thread create failure without broadening it.
+
+        Error 99992402 is specific to the ``thread_id`` create route. Preserve
+        the topic when a reply anchor is available; otherwise make one clearly
+        labelled delivery to the original chat. Return the recovered route so
+        later chunks of the same response do not retry the stale thread.
+        """
+        thread_id = (metadata or {}).get("thread_id")
+        if (
+            self._response_succeeded(response)
+            or getattr(response, "code", None) != 99992402
+            or not thread_id
+        ):
+            return response, None, False
+
+        reply_anchor = (metadata or {}).get("reply_to_message_id")
+        if not reply_anchor:
+            reply_anchor = await self._fetch_last_message_in_thread(str(thread_id))
+        if reply_anchor:
+            logger.info(
+                "[Feishu] Thread %s is stale for create routing; retrying as reply to %s",
+                thread_id,
+                reply_anchor,
+            )
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type=msg_type,
+                payload=payload,
+                reply_to=str(reply_anchor),
+                metadata=metadata,
+            )
+            if self._response_succeeded(response):
+                return response, str(reply_anchor), True
+
+        logger.warning(
+            "[Feishu] Thread %s delivery failed; forwarding reply to chat %s",
+            thread_id,
+            chat_id,
+        )
+        fallback_content = f"{_STALE_THREAD_FALLBACK_NOTICE}\n\n{chunk}"
+        if msg_type == "post":
+            fallback_msg_type, fallback_payload = self._build_outbound_payload(
+                fallback_content,
+                prefer_post=True,
+            )
+        else:
+            # If Feishu already rejected a post payload and ``send`` fell back
+            # to text, bypass markdown inference so this final chat-level
+            # recovery attempt cannot resurrect the rejected format.
+            fallback_msg_type = "text"
+            fallback_payload = json.dumps(
+                {
+                    "text": (
+                        f"{_STALE_THREAD_FALLBACK_NOTICE}\n\n"
+                        f"{_strip_markdown_to_plain_text(chunk)}"
+                    )
+                },
+                ensure_ascii=False,
+            )
+        fallback_msg_type, fallback_payload = self._apply_outbound_at_to_payload(
+            fallback_msg_type,
+            fallback_payload,
+            chunk_at_ref,
+        )
+        return (
+            await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type=fallback_msg_type,
+                payload=fallback_payload,
+                reply_to=None,
+                metadata=None,
+            ),
+            None,
+            True,
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -1989,6 +2112,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 msg_type, payload = self._apply_outbound_at_to_payload(
                     msg_type, payload, chunk_at_ref,
                 )
+                active_msg_type = msg_type
+                active_payload = payload
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
@@ -2006,6 +2131,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         chunk_at_ref,
                     )
+                    active_msg_type = fallback_msg_type
+                    active_payload = fallback_payload
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type=fallback_msg_type,
@@ -2024,6 +2151,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         chunk_at_ref,
                     )
+                    active_msg_type = fallback_msg_type
+                    active_payload = fallback_payload
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type=fallback_msg_type,
@@ -2031,6 +2160,21 @@ class FeishuAdapter(BasePlatformAdapter):
                         reply_to=reply_to,
                         metadata=metadata,
                     )
+                response, recovered_reply_to, route_recovered = (
+                    await self._recover_stale_thread_send(
+                        response=response,
+                        chat_id=chat_id,
+                        chunk=chunk,
+                        msg_type=active_msg_type,
+                        payload=active_payload,
+                        chunk_at_ref=chunk_at_ref,
+                        metadata=metadata,
+                    )
+                )
+                if route_recovered:
+                    reply_to = recovered_reply_to
+                    if recovered_reply_to is None:
+                        metadata = None
                 self._remember_outbound_at(
                     self._extract_response_field(response, "message_id"),
                     chunk_at_ref,
@@ -4977,6 +5121,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 ListMessageRequest.builder()
                 .container_id_type("thread")
                 .container_id(thread_id)
+                .sort_type("ByCreateTimeDesc")
                 .page_size(1)
                 .build()
             )

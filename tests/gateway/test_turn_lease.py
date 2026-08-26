@@ -214,7 +214,10 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     runner._post_turn_goal_continuation = AsyncMock()
 
     try:
-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=1)
+        # Keep this outer watchdog comfortably above the 20 ms lease budget.
+        # Under the 16-worker full suite, process scheduling can exceed one
+        # second even though the lease timeout itself still fires promptly.
+        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=5)
     finally:
         assert runner._turn_leases.release(holder) is True
 

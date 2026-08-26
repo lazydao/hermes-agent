@@ -1683,6 +1683,15 @@ class ProcessRegistry:
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
 
+    def was_completion_polled(self, session_id: str) -> bool:
+        """Whether a terminal completion was observed through ``poll()``.
+
+        Poll remains read-only for autonomous notification purposes. Gateway
+        turn draining uses this narrower signal only to deduplicate a queued
+        completion from the same originating user turn.
+        """
+        return session_id in self._poll_observed
+
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop parked on this session should still be parked.
 

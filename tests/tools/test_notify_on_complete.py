@@ -260,6 +260,7 @@ class TestCompletionConsumed:
         registry.poll("proc_gw")
         # CLI-side dedup signal present...
         assert "proc_gw" in registry._poll_observed
+        assert registry.was_completion_polled("proc_gw")
         # ...but the gateway watcher gate is untouched, so it still delivers.
         assert not registry.is_completion_consumed("proc_gw")
 
@@ -270,6 +271,7 @@ class TestCompletionConsumed:
 
         registry.poll("proc_run2")
         assert "proc_run2" not in registry._poll_observed
+        assert not registry.was_completion_polled("proc_run2")
 
     def test_wait_and_log_still_skip_cli_drain(self, registry):
         """wait()/read_log() consume the output, so the CLI drain skips their

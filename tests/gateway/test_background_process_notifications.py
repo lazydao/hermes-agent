@@ -280,6 +280,7 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
     )
 
     evt = {
+        "type": "completion",
         "session_id": "proc_watch",
         "session_key": "agent:main:telegram:dm:123:24296",
         "message_id": "777",
@@ -291,6 +292,7 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
     synth_event = adapter.handle_message.await_args.args[0]
     assert synth_event.message_id == "777"
     assert synth_event.source.thread_id == "24296"
+    assert synth_event.metadata["background_process_completion_session_id"] == "proc_watch"
 
 
 @pytest.mark.asyncio

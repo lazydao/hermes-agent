@@ -3122,6 +3122,8 @@ def terminal_tool(
                 """
                 if env is None:
                     return None
+                if "\x00" in script_path:
+                    return None
                 try:
                     local_path = Path(script_path).expanduser()
                     if not local_path.is_absolute():

@@ -5832,6 +5832,103 @@ class BasePlatformAdapter(ABC):
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
 
+    async def _deliver_final_response(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        message_ref: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+        record_delivery: bool = True,
+        delivery_adapter: Optional["BasePlatformAdapter"] = None,
+    ) -> "SendResult":
+        """Deliver one final response through retry + durable ledger handling.
+
+        Both the normal adapter completion path and the runner's in-band queued
+        follow-up path owe the same delivery guarantees. Keeping those
+        guarantees here prevents the queued path from bypassing retries,
+        ignoring ``SendResult.success``, or losing the response across a
+        gateway restart.
+        """
+        delivery_adapter = delivery_adapter or self._final_delivery_adapter(source)
+        obligation_id = None
+        if record_delivery:
+            try:
+                from gateway.delivery_ledger import (
+                    compute_obligation_id,
+                    ledger_enabled,
+                    mark_attempting,
+                    record_obligation,
+                )
+
+                if await asyncio.to_thread(ledger_enabled):
+                    obligation_id = compute_obligation_id(
+                        session_key,
+                        str(message_ref or ""),
+                        content,
+                    )
+                    await asyncio.to_thread(
+                        record_obligation,
+                        obligation_id=obligation_id,
+                        session_key=session_key,
+                        platform=str(
+                            getattr(source.platform, "value", source.platform)
+                        ),
+                        chat_id=source.chat_id,
+                        thread_id=getattr(source, "thread_id", None),
+                        content=content,
+                        adapter_profile=getattr(
+                            delivery_adapter, "_owner_profile", None
+                        ),
+                        reply_to_message_id=reply_to,
+                    )
+                    await asyncio.to_thread(mark_attempting, obligation_id)
+            except Exception:
+                logger.debug("delivery ledger record failed", exc_info=True)
+                obligation_id = None
+
+        result = await delivery_adapter._send_with_retry(
+            chat_id=source.chat_id,
+            content=content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if obligation_id is not None:
+            try:
+                from gateway.delivery_ledger import mark_delivered, mark_failed
+
+                if getattr(result, "success", False):
+                    await asyncio.to_thread(mark_delivered, obligation_id)
+                else:
+                    delivery_error = str(getattr(result, "error", "") or "")
+                    await asyncio.to_thread(
+                        mark_failed,
+                        obligation_id,
+                        delivery_error,
+                    )
+                    if delivery_error == "send_path_degraded":
+                        live_adapter = self._final_delivery_adapter(source)
+                        runtime_redeliver = getattr(
+                            getattr(self, "gateway_runner", None),
+                            "_redeliver_failed_obligations_for_platform",
+                            None,
+                        )
+                        if (
+                            live_adapter is not delivery_adapter
+                            and callable(runtime_redeliver)
+                        ):
+                            await runtime_redeliver(
+                                source.platform,
+                                profile=getattr(
+                                    delivery_adapter, "_owner_profile", None
+                                ),
+                            )
+            except Exception:
+                logger.debug("delivery ledger update failed", exc_info=True)
+        return result
+
     @staticmethod
     def _merge_caption(existing_text: Optional[str], new_text: str) -> str:
         """Merge a new caption into existing text, avoiding duplicates.
@@ -6778,108 +6875,22 @@ class BasePlatformAdapter(ABC):
                         event.source.chat_id,
                     )
                     _reply_anchor = _reply_anchor_for_event(event)
-                    # Delivery-obligation ledger: durably record the final
-                    # response BEFORE the send attempt so a gateway crash
-                    # between finalize and platform ACK can redeliver it on
-                    # the next boot instead of silently losing the turn's
-                    # output (#58818). Best-effort at every step — ledger
-                    # trouble must never block or delay the actual send.
-                    # Slash-command and ephemeral replies are cheap to
-                    # regenerate and are not recorded.
-                    _obligation_id = None
-                    if not is_ephemeral_response and not str(
-                        event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
-                        try:
-                            from gateway.delivery_ledger import (
-                                compute_obligation_id,
-                                ledger_enabled,
-                                mark_attempting,
-                                record_obligation,
-                            )
-
-                            if await asyncio.to_thread(ledger_enabled):
-                                _obligation_id = compute_obligation_id(
-                                    session_key,
-                                    str(getattr(event, "message_id", "") or ""),
-                                    text_content,
-                                )
-                                await asyncio.to_thread(
-                                    record_obligation,
-                                    obligation_id=_obligation_id,
-                                    session_key=session_key,
-                                    platform=str(
-                                        getattr(event.source.platform, "value",
-                                                event.source.platform)
-                                    ),
-                                    chat_id=event.source.chat_id,
-                                    thread_id=getattr(event.source, "thread_id", None),
-                                    content=text_content,
-                                    adapter_profile=getattr(
-                                        delivery_adapter, "_owner_profile", None
-                                    ),
-                                    reply_to_message_id=_reply_anchor,
-                                )
-                                await asyncio.to_thread(mark_attempting, _obligation_id)
-                        except Exception:
-                            logger.debug("delivery ledger record failed", exc_info=True)
-                            _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
+                    result = await self._deliver_final_response(
+                        source=event.source,
+                        session_key=session_key,
+                        message_ref=str(getattr(event, "message_id", "") or ""),
                         content=text_content,
                         reply_to=_reply_anchor,
                         metadata=_final_thread_metadata,
+                        delivery_adapter=delivery_adapter,
+                        record_delivery=(
+                            not is_ephemeral_response
+                            and not str(event.text or "").lstrip().startswith(
+                                ("/", self.typed_command_prefix or "!")
+                            )
+                        ),
                     )
                     _record_delivery(result)
-                    if _obligation_id is not None:
-                        try:
-                            from gateway.delivery_ledger import (
-                                mark_delivered,
-                                mark_failed,
-                            )
-
-                            if getattr(result, "success", False):
-                                await asyncio.to_thread(mark_delivered, _obligation_id)
-                            else:
-                                _delivery_error = str(
-                                    getattr(result, "error", "") or ""
-                                )
-                                await asyncio.to_thread(
-                                    mark_failed,
-                                    _obligation_id,
-                                    _delivery_error,
-                                )
-                                # A replacement can finish reconnecting before
-                                # this in-flight failure reaches mark_failed. In
-                                # that ordering the watcher's sweep found no row.
-                                # Signal a second transactional sweep only when a
-                                # new live adapter is already installed; atomic
-                                # claiming makes concurrent signals idempotent.
-                                if _delivery_error == "send_path_degraded":
-                                    _live_adapter = self._final_delivery_adapter(
-                                        event.source
-                                    )
-                                    _runtime_redeliver = getattr(
-                                        getattr(self, "gateway_runner", None),
-                                        "_redeliver_failed_obligations_for_platform",
-                                        None,
-                                    )
-                                    if (
-                                        _live_adapter is not delivery_adapter
-                                        and callable(_runtime_redeliver)
-                                    ):
-                                        await _runtime_redeliver(
-                                            event.source.platform,
-                                            profile=getattr(
-                                                delivery_adapter,
-                                                "_owner_profile",
-                                                None,
-                                            ),
-                                        )
-                        except Exception:
-                            logger.debug(
-                                "delivery ledger update failed", exc_info=True
-                            )
 
                     # Schedule auto-deletion on the adapter that owns the new
                     # message ID, which may be the reconnect replacement.

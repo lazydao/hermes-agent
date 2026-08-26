@@ -1,5 +1,6 @@
 import asyncio
 import subprocess
+import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -313,6 +314,28 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
 # writes a planned-stop marker first, so it is NOT signal-initiated and
 # DOES persist "stopped", respecting the explicit intent.
 # ---------------------------------------------------------------------------
+
+
+def test_systemd_managed_sigterm_is_clean_but_unmanaged_signal_is_not():
+    context = {
+        "parent": {"name": "systemd"},
+        "under_systemd": True,
+    }
+
+    assert gateway_run._is_systemd_managed_sigterm(signal.SIGTERM, context)
+    assert not gateway_run._is_systemd_managed_sigterm(signal.SIGINT, context)
+    assert gateway_run._is_systemd_managed_sigterm(
+        signal.SIGTERM,
+        {
+            "parent": {"name": "python"},
+            "under_systemd": True,
+            "systemd_invocation_id": "invocation-1",
+        },
+    )
+    assert not gateway_run._is_systemd_managed_sigterm(
+        signal.SIGTERM,
+        {"parent": {"name": "container-init"}, "under_systemd": True},
+    )
 
 
 def _persisted_states(runner) -> list:

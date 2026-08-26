@@ -1183,6 +1183,95 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_local_binary_does_not_fall_back_to_remote_reader(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        binary = tmp_path / "tool"
+        binary.write_bytes(b"\x7fELF\x00hermes gateway restart")
+        binary.chmod(0o755)
+        remote_reads = []
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            str(binary),
+            read_remote_script=lambda path: remote_reads.append(path)
+            or "hermes gateway restart",
+        )
+
+        assert result is False
+        assert remote_reads == []
+
+    def test_missing_local_script_can_still_use_remote_reader(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        missing = tmp_path / "remote-only.sh"
+        remote_reads = []
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            str(missing),
+            read_remote_script=lambda path: remote_reads.append(path)
+            or "hermes gateway restart",
+        )
+
+        assert result is True
+        assert remote_reads == [str(missing.resolve())]
+
+    def test_unreadable_local_script_does_not_fall_back_to_remote_reader(
+        self, tmp_path, monkeypatch,
+    ):
+        from cron import lifecycle_guard
+
+        script = tmp_path / "blocked.sh"
+        script.write_text("echo safe", encoding="utf-8")
+        remote_reads = []
+        real_open = lifecycle_guard.os.open
+
+        def denied_open(path, flags):
+            if path == script:
+                raise PermissionError("denied")
+            return real_open(path, flags)
+
+        monkeypatch.setattr(lifecycle_guard.os, "open", denied_open)
+
+        result = lifecycle_guard.contains_gateway_lifecycle_command_or_referenced_script(
+            str(script),
+            read_remote_script=lambda path: remote_reads.append(path)
+            or "echo remote safe",
+        )
+
+        assert result is True
+        assert remote_reads == []
+
+    def test_remote_binary_content_is_not_recursively_scanned(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        missing = tmp_path / "remote-binary"
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            str(missing),
+            read_remote_script=lambda _path: "\x7fELF\x00hermes gateway restart",
+        )
+
+        assert result is False
+
+    def test_nul_path_never_reaches_remote_reader(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        remote_reads = []
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f"{tmp_path}/bad\x00path.sh",
+            read_remote_script=lambda path: remote_reads.append(path) or "unsafe",
+        )
+
+        assert result is False
+        assert remote_reads == []
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""

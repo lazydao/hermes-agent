@@ -117,6 +117,9 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
+_BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY = (
+    "background_process_completion_session_id"
+)
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -132,6 +135,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|configured\s+auxiliary\s+compression\s+provider\s+.+\s+unavailable"
     r"|skipping\s+concurrent\s+compression"
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
+    r"|context\s+compaction\s+complete\s+[—-]\s+continuing\s+turn"
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
     r"|preflight\s+compression"
     r"|pre[- ]api\s+compression"
@@ -521,6 +525,7 @@ _COMPRESSION_PROGRESS_STATUS_RE = re.compile(
     "|".join(
         _status_template_to_regex(_template)
         for _template in (
+            COMPACTION_DONE_STATUS,
             COMPACTION_STATUS,
             COMPACTION_DONE_STATUS,
             PRE_API_COMPRESSION_STATUS_TEMPLATE,
@@ -3652,6 +3657,42 @@ def _should_defer_internal_iteration_limit_response(
         return False
     exit_reason = str(result.get("turn_exit_reason") or "")
     return exit_reason.startswith("max_iterations_reached(")
+
+
+def _should_suppress_same_turn_polled_process_completion(
+    result: dict | None,
+    pending_event: MessageEvent | None,
+    current_message_id: str | None,
+) -> bool:
+    """Deduplicate a completion already observed by this successful turn.
+
+    A terminal ``poll()`` remains read-only and must not globally consume the
+    autonomous notification. Suppression is limited to the queued internal
+    completion tied to the same originating platform message, after that turn
+    has produced a successful visible response.
+    """
+    if (
+        not _should_clear_resume_pending_after_turn(result or {})
+        or not str((result or {}).get("final_response") or "").strip()
+        or pending_event is None
+        or not bool(getattr(pending_event, "internal", False))
+    ):
+        return False
+
+    metadata = getattr(pending_event, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    process_id = str(
+        metadata.get(_BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY) or ""
+    ).strip()
+    origin_message_id = str(getattr(pending_event, "message_id", None) or "").strip()
+    active_message_id = str(current_message_id or "").strip()
+    if not process_id or not origin_message_id or origin_message_id != active_message_id:
+        return False
+
+    from tools.process_registry import process_registry
+
+    return process_registry.was_completion_polled(process_id)
 
 
 def _request_chain_budget_from_event(
@@ -24384,6 +24425,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response: str,
         source: SessionSource,
         adapter,
+        session_key: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
         event_message_id: Optional[str] = None,
         text_already_delivered: bool = False,
@@ -24428,11 +24470,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _qe,
                         )
                 if not _reconciled:
-                    await adapter.send(
-                        source.chat_id,
-                        text_content,
-                        metadata=metadata,
-                    )
+                    if session_key:
+                        await adapter._deliver_final_response(
+                            source=source,
+                            session_key=session_key,
+                            message_ref=str(event_message_id or ""),
+                            content=text_content,
+                            reply_to=event_message_id,
+                            metadata=metadata,
+                        )
+                    else:
+                        # Preserve the helper's established direct-call
+                        # contract for callers without a durable session key.
+                        await adapter.send(
+                            source.chat_id,
+                            text_content,
+                            metadata=metadata,
+                        )
 
         # Failed turns still deliver their (normalized failure) text above,
         # but must not upload attachments as if the turn succeeded — mirrors
@@ -27260,6 +27314,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            if str(evt.get("type") or "") == "completion":
+                process_id = str(evt.get("session_id") or "").strip()
+                if process_id:
+                    metadata[_BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY] = (
+                        process_id
+                    )
             request_chain_budget = evt.get(REQUEST_CHAIN_BUDGET_EVENT_KEY)
             if isinstance(request_chain_budget, IterationBudget):
                 metadata[REQUEST_CHAIN_BUDGET_EVENT_KEY] = request_chain_budget
@@ -31504,6 +31564,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _leftover_steer_for_followup = False
             if result and adapter and session_key:
                 pending_event = _dequeue_pending_event(adapter, session_key)
+                if _should_suppress_same_turn_polled_process_completion(
+                    result,
+                    pending_event,
+                    platform_message_id or event_message_id,
+                ):
+                    process_id = pending_event.metadata.get(
+                        _BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY,
+                        "unknown",
+                    )
+                    logger.info(
+                        "Suppressing same-turn observed background completion for %s",
+                        process_id,
+                    )
+                    pending_event = None
                 # /queue overflow: after consuming the adapter's "next-up"
                 # slot, promote the next queued event into it so the
                 # recursive run's drain will see it.  This keeps the slot
@@ -31685,6 +31759,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 first_response,
                                 source=source,
                                 adapter=adapter,
+                                session_key=session_key,
                                 metadata=_status_thread_metadata,
                                 event_message_id=event_message_id,
                                 text_already_delivered=_already_streamed,
@@ -32213,7 +32288,39 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, cron_provider=None):
+def _is_systemd_managed_sigterm(
+    received_signal: Any,
+    shutdown_context: Optional[Dict[str, Any]],
+) -> bool:
+    """Return whether SIGTERM reached a process directly parented by systemd.
+
+    systemd stop/restart already owns the process relaunch decision. Treating
+    its normal SIGTERM as a gateway failure only produces a false failed-unit
+    transition for the old process. Unmarked signals outside that concrete
+    service-manager context retain the historical fail/revive behavior.
+    """
+    if received_signal != signal.SIGTERM or not shutdown_context:
+        return False
+    parent = shutdown_context.get("parent")
+    nested_parent_name = parent.get("name") if isinstance(parent, dict) else None
+    parent_name = str(
+        nested_parent_name or shutdown_context.get("parent_name") or ""
+    ).strip().lower()
+    invocation_id = str(
+        shutdown_context.get("systemd_invocation_id") or ""
+    ).strip()
+    return bool(invocation_id) or (
+        bool(shutdown_context.get("under_systemd")) and parent_name == "systemd"
+    )
+
+
+def _start_gateway_housekeeping(
+    stop_event: threading.Event,
+    adapters=None,
+    loop=None,
+    interval: int = 60,
+    cron_provider=None,
+):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -33005,10 +33112,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         except Exception as e:
             logger.debug("Takeover marker check failed: %s", e)
 
-        # Planned stop check: service managers and `hermes gateway stop`
-        # also send SIGTERM, which is indistinguishable from an unexpected
-        # external kill unless the CLI marks it first. SIGINT comes from an
-        # interactive Ctrl+C and is likewise an intentional foreground stop.
+        # Planned stop check: CLI-managed service stops and `hermes gateway
+        # stop` write a marker before SIGTERM. Direct systemd stop/restart is
+        # recognized separately from the process context below. SIGINT comes
+        # from an interactive Ctrl+C and is an intentional foreground stop.
         planned_stop = False
         if received_signal == signal.SIGINT:
             planned_stop = True
@@ -33036,6 +33143,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _shutdown_ctx = None
             logger.debug("snapshot_shutdown_context failed: %s", _e)
 
+        systemd_managed_stop = (
+            not planned_takeover
+            and not planned_stop
+            and _is_systemd_managed_sigterm(received_signal, _shutdown_ctx)
+        )
+
         if planned_takeover:
             logger.info(
                 "Received %s as a planned --replace takeover — exiting cleanly",
@@ -33045,6 +33158,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logger.info(
                 "Received %s as a planned gateway stop — exiting cleanly",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
+            )
+        elif systemd_managed_stop:
+            logger.info(
+                "Received SIGTERM under systemd management — exiting cleanly"
             )
         else:
             _signal_initiated_shutdown = True

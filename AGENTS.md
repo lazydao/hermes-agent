@@ -1374,7 +1374,7 @@ upstream synchronization is gated by upstream release tags:
   `h3/main` or restarting the live gateways.
 - Selectively backport an untagged upstream fix only for a confirmed critical
   security or production issue and only after explicit user approval.
-- The current evaluated release baseline is `v2026.8.3`; update this baseline
+- The current evaluated release baseline is `v2026.8.19`; update this baseline
   as part of each completed upstream synchronization.
 
 ### Prompt Caching Must Not Break

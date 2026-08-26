@@ -93,6 +93,12 @@ def test_compaction_completion_notice_respects_progress_notices_gate(
     else:
         assert result is None
 
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    assert (
+        _prepare_gateway_status_message(platform, "compacted", COMPACTION_DONE_STATUS)
+        is None
+    )
+
 
 def test_enabled_gate_does_not_leak_to_raw_platforms(progress_notices_enabled):
     """Programmatic surfaces keep raw text regardless of the gate."""
