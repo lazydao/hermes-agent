@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, Mock, patch
 from plugins.platforms.feishu.feishu_comment import (
     parse_drive_comment_event,
     _ALLOWED_NOTICE_TYPES,
+    _run_comment_agent,
+    _run_comment_agent_with_context,
     _sanitize_comment_text,
 )
 
@@ -115,6 +117,90 @@ class TestSanitizeCommentText(unittest.TestCase):
         self.assertEqual(result, "a &lt; b &amp; c &gt; d")
         self.assertNotIn("&amp;lt;", result)
         self.assertNotIn("&amp;gt;", result)
+
+
+class TestCommentAgentRuntime(unittest.TestCase):
+    @patch(
+        "plugins.platforms.feishu.feishu_comment._resolve_comment_agent_toolsets",
+        return_value=(
+            ["feishu_doc", "feishu_drive", "file", "skills", "terminal"],
+            ["memory"],
+        ),
+    )
+    @patch(
+        "plugins.platforms.feishu.feishu_comment._resolve_model_and_runtime",
+        return_value=("test-model", {"provider": "test-provider"}),
+    )
+    @patch("run_agent.AIAgent")
+    def test_uses_feishu_platform_tools_and_project_context(
+        self,
+        mock_agent_cls,
+        _mock_runtime,
+        _mock_toolsets,
+    ):
+        agent = Mock()
+        agent.run_conversation.return_value = {
+            "final_response": "done",
+            "api_calls": 0,
+            "messages": [],
+        }
+        mock_agent_cls.return_value = agent
+
+        result = _run_comment_agent(
+            "prompt",
+            Mock(),
+            session_key="comment-doc:docx:token",
+            user_id="ou_user",
+        )
+
+        self.assertEqual(result, "done")
+        kwargs = mock_agent_cls.call_args.kwargs
+        self.assertEqual(
+            kwargs["enabled_toolsets"],
+            ["feishu_doc", "feishu_drive", "file", "skills", "terminal"],
+        )
+        self.assertEqual(kwargs["disabled_toolsets"], ["memory"])
+        self.assertFalse(kwargs["skip_context_files"])
+        self.assertTrue(kwargs["load_soul_identity"])
+        self.assertTrue(kwargs["skip_memory"])
+        self.assertEqual(kwargs["platform"], "feishu")
+        self.assertEqual(kwargs["user_id"], "ou_user")
+        self.assertEqual(kwargs["chat_type"], "document_comment")
+        self.assertEqual(kwargs["gateway_session_key"], "comment-doc:docx:token")
+
+    @patch("gateway.session_context.clear_session_vars")
+    @patch("gateway.session_context.set_session_vars", return_value=["token"])
+    @patch("gateway.session_context.reset_session_vars")
+    @patch("hermes_cli.profiles.get_active_profile_name", return_value="default")
+    @patch("plugins.platforms.feishu.feishu_comment._run_comment_agent", return_value="done")
+    def test_binds_feishu_identity_for_local_tools(
+        self,
+        mock_run,
+        _mock_profile,
+        mock_reset,
+        mock_set,
+        mock_clear,
+    ):
+        result = _run_comment_agent_with_context(
+            "prompt",
+            Mock(),
+            session_key="comment-doc:docx:token",
+            user_id="ou_user",
+        )
+
+        self.assertEqual(result, "done")
+        mock_reset.assert_called_once_with()
+        mock_set.assert_called_once_with(
+            platform="feishu",
+            chat_type="document_comment",
+            user_id="ou_user",
+            session_key="comment-doc:docx:token",
+            profile="default",
+            async_delivery=False,
+            cron_session="",
+        )
+        mock_run.assert_called_once()
+        mock_clear.assert_called_once_with(["token"])
 
 
 class TestWikiReverseLookup(unittest.TestCase):

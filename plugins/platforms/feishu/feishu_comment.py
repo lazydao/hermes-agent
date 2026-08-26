@@ -14,7 +14,8 @@ Flow:
        Whole -> list whole comments timeline
        Local -> list comment thread replies
   5. Build prompt (local or whole)
-  6. Create AIAgent with feishu_doc + feishu_drive tools -> agent generates reply
+  6. Create AIAgent with the configured Feishu tools and project context
+     -> agent generates reply
   7. Route reply:
        Whole -> add_whole_comment
        Local -> reply_to_comment (fallback to add_whole_comment on 1069302)
@@ -1044,8 +1045,25 @@ def _save_session_history(key: str, messages: List[Dict[str, Any]]) -> None:
         logger.info("[Feishu-Comment] Session saved: %s (%d messages)", key, len(cleaned))
 
 
-def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
-    """Create an AIAgent with feishu tools and run the prompt.
+def _resolve_comment_agent_toolsets() -> Tuple[List[str], List[str]]:
+    """Resolve the same configured toolsets as a normal Feishu gateway turn."""
+    from gateway.run import _load_gateway_config
+    from hermes_cli.tools_config import _get_platform_tools
+
+    user_config = _load_gateway_config()
+    enabled_toolsets = sorted(_get_platform_tools(user_config, "feishu"))
+    agent_config = user_config.get("agent") or {}
+    disabled_toolsets = agent_config.get("disabled_toolsets") or []
+    return enabled_toolsets, disabled_toolsets
+
+
+def _run_comment_agent(
+    prompt: str,
+    client: Any,
+    session_key: str = "",
+    user_id: str = "",
+) -> str:
+    """Create an AIAgent with Feishu tools and project context, then run it.
 
     If *session_key* is provided, loads/saves conversation history for
     cross-card memory within the same document.
@@ -1062,6 +1080,7 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
 
     try:
         model, runtime_kwargs = _resolve_model_and_runtime()
+        enabled_toolsets, disabled_toolsets = _resolve_comment_agent_toolsets()
         logger.info("[Feishu-Comment] _run_comment_agent: model=%s provider=%s base_url=%s",
                     model, runtime_kwargs.get("provider"), (runtime_kwargs.get("base_url") or "")[:50])
 
@@ -1079,10 +1098,16 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
             api_mode=runtime_kwargs.get("api_mode"),
             credential_pool=runtime_kwargs.get("credential_pool"),
             quiet_mode=True,
-            skip_context_files=True,
+            skip_context_files=False,
+            load_soul_identity=True,
             skip_memory=True,
             max_iterations=15,
-            enabled_toolsets=["feishu_doc", "feishu_drive"],
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            platform="feishu",
+            user_id=user_id,
+            chat_type="document_comment",
+            gateway_session_key=session_key,
         )
         logger.info("[Feishu-Comment] _run_comment_agent: calling run_conversation (prompt=%d chars, history=%d)",
                     len(prompt), len(history))
@@ -1105,6 +1130,42 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
     finally:
         set_doc_client(None)
         set_drive_client(None)
+
+
+def _run_comment_agent_with_context(
+    prompt: str,
+    client: Any,
+    session_key: str = "",
+    user_id: str = "",
+) -> str:
+    """Run a comment agent with Feishu identity bound for local tools."""
+    from gateway.session_context import (
+        clear_session_vars,
+        reset_session_vars,
+        set_session_vars,
+    )
+
+    reset_session_vars()
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        profile = get_active_profile_name()
+    except Exception:
+        profile = ""
+
+    tokens = set_session_vars(
+        platform="feishu",
+        chat_type="document_comment",
+        user_id=user_id,
+        session_key=session_key,
+        profile=profile,
+        async_delivery=False,
+        cron_session="",
+    )
+    try:
+        return _run_comment_agent(prompt, client, session_key, user_id)
+    finally:
+        clear_session_vars(tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -1351,7 +1412,12 @@ async def handle_drive_comment_event(
     sess_key = _session_key(file_type, file_token)
     loop = asyncio.get_running_loop()
     response = await loop.run_in_executor(
-        None, _run_comment_agent, prompt, client, sess_key,
+        None,
+        _run_comment_agent_with_context,
+        prompt,
+        client,
+        sess_key,
+        from_open_id,
     )
 
     if not response or _NO_REPLY_SENTINEL in response:

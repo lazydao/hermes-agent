@@ -35,6 +35,7 @@ informative rejection instead of scheduling a job that will only fail
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import re
@@ -451,8 +452,8 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
     return None
 
 
-def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
-    """Return ``(text, unsafe)`` using bounded, regular-file-only reads.
+def _read_referenced_script_state(path: Path) -> tuple[Optional[str], bool, bool]:
+    """Return ``(text, unsafe, handled_locally)`` from a bounded local read.
 
     This is the shared choke point for every local script read the guard
     performs (the terminal walk in ``_contains_unsafe_gateway_action`` AND
@@ -462,9 +463,16 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     evicted placeholder's ``open()`` can hang preflight indefinitely
     (#88052). The lexical check covers direct cloud paths; the resolved
     check covers local launchers that are symlinks into a cloud subtree.
+
+    ``handled_locally`` distinguishes a missing local path (where a remote
+    backend may legitimately retry) from a path that was already identified
+    as a binary or invalid local reference and must not be decoded again by a
+    fallback reader.
     """
+    if "\x00" in os.fspath(path):
+        return None, False, True
     if _is_cloud_placeholder_path(path):
-        return None, True
+        return None, True, True
     try:
         resolved = path.resolve(strict=False)
     except (OSError, ValueError):
@@ -473,17 +481,23 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         # guarded path must never crash the guard (#76762).
         resolved = path
     if _is_cloud_placeholder_path(resolved):
-        return None, True
+        return None, True, True
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except (OSError, ValueError):
-        # OSError: unreadable / missing / over-long paths. ValueError: an
-        # embedded NUL byte in *path* itself — a binary's decoded bytes
-        # tokenized into a bogus script path by the recursion (#77703). A
-        # guarded read must never crash the guard, so treat either as
-        # "nothing to scan" (mirrors the resolve() ValueError guard below).
-        return None, False
+    except ValueError:
+        return None, False, True
+    except FileNotFoundError:
+        return None, False, False
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            # An overlong token cannot name a local script and must not be
+            # forwarded to a remote reader. Treat it as handled but benign.
+            return None, False, True
+        # A local path that exists but cannot be opened is not evidence that
+        # the same path should be retried against a remote backend. Fail
+        # closed and keep the callback reserved for genuinely missing paths.
+        return None, True, True
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -493,8 +507,8 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
             # to fail-closed, blocking ``source ~/.zshrc`` (#86753).
             # Devices/sockets stay fail-closed.
             if stat.S_ISDIR(metadata.st_mode):
-                return None, False
-            return None, True
+                return None, False, True
+            return None, True, True
         # Sniff a small prefix first: files that are clearly compiled
         # binaries (executable magic, or NUL bytes in the head) are never
         # shell scripts, so skip them WITHOUT reading the rest — reading a
@@ -502,7 +516,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         # budget and (pre-#77703) fed decoded garbage into the recursion.
         data = os.read(descriptor, _BINARY_SNIFF_BYTES)
         if data.startswith(_BINARY_MAGIC_PREFIXES) or b"\x00" in data:
-            return None, False
+            return None, False, True
         # Read the remainder (bounded). Loop because os.read may return
         # short for non-regular-file-backed descriptors.
         while len(data) <= _MAX_REFERENCED_SCRIPT_BYTES:
@@ -513,7 +527,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
                 break
             data += chunk
     except OSError:
-        return None, False
+        return None, True, True
     finally:
         os.close(descriptor)
     # A NUL byte in the first chunk means this is a binary (ELF/Mach-O/
@@ -523,10 +537,16 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
     # executed by the user is not a referenced *shell script*.
     if b"\x00" in data:
-        return None, False
+        return None, False, True
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
-        return None, True
-    return data.decode("utf-8", errors="replace"), False
+        return None, True, True
+    return data.decode("utf-8", errors="replace"), False, True
+
+
+def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
+    """Return the established ``(text, unsafe)`` local-read contract."""
+    text, unsafe, _handled_locally = _read_referenced_script_state(path)
+    return text, unsafe
 
 
 def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bool]:
@@ -589,26 +609,34 @@ def _contains_unsafe_gateway_action(
             return True
         try:
             resolved = script_path.resolve(strict=False)
-        except (OSError, ValueError):
-            # OSError: unreadable/long paths. ValueError: embedded NUL byte
-            # from a binary's decoded contents tokenized as a path — a
-            # guarded path must never crash the guard (#76762).
+        except ValueError:
+            # Embedded NUL paths are neither valid local paths nor safe remote
+            # fallback inputs. Drop them before any callback sees them.
+            continue
+        except (OSError, RuntimeError):
+            # Preserve the bounded reader/fallback behavior for unreadable or
+            # unusually long paths while keeping one canonical path below.
+            # RuntimeError covers symlink loops from Path.resolve().
             resolved = script_path
         if _is_cloud_placeholder_path(resolved):
             return True
         if resolved in visited:
             continue
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        script_text, unsafe, handled_locally = _read_referenced_script_state(resolved)
         if unsafe:
             return True
-        if script_text is None and read_remote_script is not None:
+        if (
+            script_text is None
+            and not handled_locally
+            and read_remote_script is not None
+        ):
             # Local path missing; try the remote backend if one is available.
             # The callback's output crosses the same trust boundary as a
             # local read — sanitize it identically before it enters the
             # recursion (binary skip + size fail-closed).
             script_text, unsafe = _sanitize_remote_script_text(
-                read_remote_script(str(script_path))
+                read_remote_script(str(resolved))
             )
             if unsafe:
                 return True
@@ -714,8 +742,8 @@ def _read_script_for_scanning(script_path: str) -> str:
     """Read a cron script with the bounded terminal-script scanner.
 
     Non-regular or oversized inputs fail closed by returning a lifecycle-shaped
-    sentinel, while missing/unreadable/unresolvable paths remain empty so
-    ordinary scheduler path validation can report them.
+    sentinel, while missing/unresolvable paths remain empty so ordinary
+    scheduler path validation can report them.
     """
     resolved = _resolve_script_path(script_path)
     if resolved is None:

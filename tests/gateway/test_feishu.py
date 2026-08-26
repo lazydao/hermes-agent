@@ -181,6 +181,61 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         # _disable_websocket_auto_reconnect() must still run.
         self.assertIsNone(adapter._ws_client)
 
+    def test_disconnect_cancels_receive_task_before_websocket_close(self):
+        """Normal 1000/OK shutdown must not become an unhandled SDK error."""
+        import threading
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        ws_thread_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+        receive_started = threading.Event()
+        close_called = threading.Event()
+
+        async def receive_forever() -> None:
+            adapter._ws_receive_task = asyncio.current_task()
+            receive_started.set()
+            await asyncio.Event().wait()
+
+        class FakeWSClient:
+            _auto_reconnect = True
+
+            async def _disconnect(self) -> None:
+                receive_task = adapter._ws_receive_task
+                self.receive_cancelled_before_close = (
+                    receive_task is not None and receive_task.cancelled()
+                )
+                close_called.set()
+
+        ws_client = FakeWSClient()
+
+        def _run_loop() -> None:
+            asyncio.set_event_loop(ws_thread_loop)
+            ws_thread_loop.create_task(receive_forever())
+            ready.set()
+            ws_thread_loop.run_forever()
+
+        thread = threading.Thread(target=_run_loop, daemon=True)
+        thread.start()
+        ready.wait()
+        receive_started.wait()
+        adapter._ws_client = ws_client
+        adapter._ws_thread_loop = ws_thread_loop
+        adapter._ws_future = None
+
+        try:
+            asyncio.run(adapter.disconnect())
+        finally:
+            if not ws_thread_loop.is_closed():
+                ws_thread_loop.call_soon_threadsafe(ws_thread_loop.stop)
+            thread.join(timeout=2.0)
+            if not ws_thread_loop.is_closed():
+                ws_thread_loop.close()
+
+        self.assertTrue(close_called.is_set())
+        self.assertTrue(ws_client.receive_cancelled_before_close)
+
 
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
@@ -346,7 +401,8 @@ class TestAdapterModule(unittest.TestCase):
         try:
             from plugins.platforms.feishu.adapter import _run_official_feishu_ws_client
 
-            _run_official_feishu_ws_client(fake_client, fake_adapter)
+            with self.assertRaisesRegex(RuntimeError, "stop test client"):
+                _run_official_feishu_ws_client(fake_client, fake_adapter)
         finally:
             sys.modules.clear()
             sys.modules.update(original_modules)
@@ -355,6 +411,48 @@ class TestAdapterModule(unittest.TestCase):
         self.assertEqual(fake_client._reconnect_nonce, 2)
         self.assertEqual(fake_client._reconnect_interval, 3)
         self.assertEqual(fake_client._ping_interval, 4)
+
+    def test_expected_websocket_cancellation_is_clean_but_live_one_surfaces(self):
+        import sys
+        from types import ModuleType
+
+        class _CancellingWSClient:
+            def start(self):
+                raise asyncio.CancelledError()
+
+        fake_client_module = ModuleType("lark_oapi.ws.client")
+        fake_client_module.loop = None
+        fake_client_module.websockets = SimpleNamespace(connect=AsyncMock())
+        fake_ws_module = ModuleType("lark_oapi.ws")
+        fake_ws_module.client = fake_client_module
+        fake_root_module = ModuleType("lark_oapi")
+        fake_root_module.ws = fake_ws_module
+        original_modules = sys.modules.copy()
+        sys.modules["lark_oapi"] = fake_root_module
+        sys.modules["lark_oapi.ws"] = fake_ws_module
+        sys.modules["lark_oapi.ws.client"] = fake_client_module
+
+        try:
+            from plugins.platforms.feishu.adapter import _run_official_feishu_ws_client
+
+            stopped_adapter = SimpleNamespace(
+                _running=False,
+                _ws_thread_loop=None,
+                _ws_receive_task=None,
+                _ws_reconnect_nonce=2,
+                _ws_reconnect_interval=3,
+                _ws_ping_interval=4,
+                _ws_ping_timeout=5,
+            )
+            _run_official_feishu_ws_client(_CancellingWSClient(), stopped_adapter)
+
+            running_adapter = SimpleNamespace(**vars(stopped_adapter))
+            running_adapter._running = True
+            with self.assertRaises(asyncio.CancelledError):
+                _run_official_feishu_ws_client(_CancellingWSClient(), running_adapter)
+        finally:
+            sys.modules.clear()
+            sys.modules.update(original_modules)
 
 
 def _admits_group(adapter, message, sender_id, chat_id=""):

@@ -1,4 +1,5 @@
 import asyncio
+import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -242,6 +243,28 @@ async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on
 # ---------------------------------------------------------------------------
 
 
+def test_systemd_managed_sigterm_is_clean_but_unmanaged_signal_is_not():
+    context = {
+        "parent": {"name": "systemd"},
+        "under_systemd": True,
+    }
+
+    assert gateway_run._is_systemd_managed_sigterm(signal.SIGTERM, context)
+    assert not gateway_run._is_systemd_managed_sigterm(signal.SIGINT, context)
+    assert gateway_run._is_systemd_managed_sigterm(
+        signal.SIGTERM,
+        {
+            "parent": {"name": "python"},
+            "under_systemd": True,
+            "systemd_invocation_id": "invocation-1",
+        },
+    )
+    assert not gateway_run._is_systemd_managed_sigterm(
+        signal.SIGTERM,
+        {"parent": {"name": "container-init"}, "under_systemd": True},
+    )
+
+
 def _persisted_states(runner) -> list:
     """All gateway_state values passed to _update_runtime_status, in order."""
     states = []
@@ -322,5 +345,3 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     assert status._pid_exists(4242) is False
-
-
