@@ -36,6 +36,7 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         chat_id=kw.get("chat_id", "C1"),
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
+        reply_to_message_id=kw.get("reply_to_message_id"),
     )
 
 
@@ -169,7 +170,7 @@ class TestGatewayRedeliverySweep:
 
     @pytest.mark.asyncio
     async def test_pending_redelivers_plain_and_clears_resume(self):
-        _record()  # pending
+        _record(reply_to_message_id="msg-42")  # pending
         _orphan("ob-1")
         adapter = self._adapter()
         runner = self._runner(adapter)
@@ -179,6 +180,7 @@ class TestGatewayRedeliverySweep:
         assert n == 1
         sent = adapter.send.call_args.kwargs
         assert sent["content"] == "the final answer"  # no marker
+        assert sent["reply_to"] == "msg-42"
         assert sent["metadata"] == {"thread_id": "171.001"}
         assert _row("ob-1")["state"] == "delivered"
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(

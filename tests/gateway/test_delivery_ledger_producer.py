@@ -62,7 +62,8 @@ def _event(text="hello agent"):
 def _rows():
     with dl._connect() as conn:
         return conn.execute(
-            "SELECT obligation_id, state, content FROM delivery_obligations"
+            "SELECT obligation_id, state, content, reply_to_message_id "
+            "FROM delivery_obligations"
         ).fetchall()
 
 
@@ -109,6 +110,7 @@ class TestProducerHook:
         assert len(rows) == 1
         assert rows[0][1] == "delivered"
         assert rows[0][2] == "final answer"
+        assert rows[0][3] == "msg-42"
 
     @pytest.mark.asyncio
     async def test_send_failure_leaves_failed_row(self):
