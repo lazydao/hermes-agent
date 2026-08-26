@@ -215,7 +215,13 @@ class FakeAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self,
+        message,
+        conversation_history=None,
+        task_id=None,
+        platform_message_id=None,
+    ):
         cb = self.tool_progress_callback
         if cb is not None:
             cb("tool.started", "terminal", "pwd", {})
@@ -896,7 +902,13 @@ class QueuedMediaAgent:
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self,
+        message,
+        conversation_history=None,
+        task_id=None,
+        platform_message_id=None,
+    ):
         type(self).calls += 1
         if type(self).calls == 1:
             final_response = f"first response\nMEDIA:{type(self).media_path}"
@@ -921,7 +933,13 @@ class QueuedSilenceAgent:
     def __init__(self, **kwargs):
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self,
+        message,
+        conversation_history=None,
+        task_id=None,
+        platform_message_id=None,
+    ):
         type(self).calls += 1
         return {
             "final_response": "NO_REPLY" if type(self).calls == 1 else "follow-up processed",
@@ -938,7 +956,13 @@ class QueuedFailedEmptyAgent:
     def __init__(self, **kwargs):
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self,
+        message,
+        conversation_history=None,
+        task_id=None,
+        platform_message_id=None,
+    ):
         type(self).calls += 1
         if type(self).calls == 1:
             return {
