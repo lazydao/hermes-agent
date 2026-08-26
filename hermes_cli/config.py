@@ -3463,18 +3463,55 @@ def render_personality_prompt(value: Any) -> str:
     return _render(value)
 
 
-def resolve_ephemeral_system_prompt_from_config(cfg: Optional[Dict[str, Any]]) -> str:
+def resolve_ephemeral_system_prompt_from_config(
+    cfg: Optional[Dict[str, Any]],
+    *,
+    base_dir: Optional[Path] = None,
+) -> str:
     """Resolve the session overlay from config.yaml.
 
     ``display.personality`` is the selected named personality and wins when set.
     Otherwise fall back to the user-owned ``agent.system_prompt``. Callers should
     still prefer ``HERMES_EPHEMERAL_SYSTEM_PROMPT`` when that env var is set.
+    ``agent.system_prompt_files`` are prepended in configured order; relative
+    paths resolve against ``base_dir`` or the active Hermes home.
 
     Delegates to :mod:`hermes_cli.personality` (single owner).
     """
     from hermes_cli.personality import resolve_ephemeral_system_prompt
 
-    return resolve_ephemeral_system_prompt(cfg)
+    prompt = resolve_ephemeral_system_prompt(cfg)
+    agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+    configured_files = (
+        agent_cfg.get("system_prompt_files")
+        if isinstance(agent_cfg, dict)
+        else None
+    )
+    if isinstance(configured_files, str):
+        configured_files = [configured_files]
+    if not isinstance(configured_files, list):
+        configured_files = []
+
+    blocks: list[str] = []
+    for configured_path in configured_files:
+        if not isinstance(configured_path, str) or not configured_path.strip():
+            continue
+        path = Path(os.path.expandvars(configured_path.strip())).expanduser()
+        if not path.is_absolute():
+            path = (base_dir or get_hermes_home()) / path
+        if not path.is_file():
+            logger.warning("System prompt file not found: %s", path)
+            continue
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            logger.warning("Failed to load system prompt file %s: %s", path, exc)
+            continue
+        if content:
+            blocks.append(content)
+    if prompt:
+        blocks.append(prompt)
+    return "\n\n".join(blocks)
 
 
 def read_raw_config() -> Dict[str, Any]:

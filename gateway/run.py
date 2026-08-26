@@ -10029,7 +10029,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if prompt:
             return prompt
         cfg = _load_gateway_runtime_config()
-        return resolve_ephemeral_system_prompt_from_config(cfg)
+        return resolve_ephemeral_system_prompt_from_config(
+            cfg,
+            base_dir=_hermes_home,
+        )
 
     def _resolve_model_for_channel(
         self,

@@ -59,5 +59,21 @@ def test_resolve_renders_dict_personality():
     assert "Style: concise" in resolved
 
 
+def test_resolve_prepends_prompt_files_from_active_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "shared.md").write_text("shared rules\n", encoding="utf-8")
+    cfg = {
+        "display": {"personality": "none"},
+        "agent": {
+            "system_prompt_files": ["shared.md"],
+            "system_prompt": "profile role",
+        },
+    }
+
+    assert resolve_ephemeral_system_prompt_from_config(cfg) == (
+        "shared rules\n\nprofile role"
+    )
+
+
 def test_render_personality_prompt_string():
     assert render_personality_prompt("  hi  ") == "hi"
