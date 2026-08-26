@@ -278,6 +278,13 @@ def _read_entries(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
             raise ActiveSessionRegistryError(
                 f"active session registry contains an invalid process start time: {path}"
             )
+        process_start_token = entry.get("process_start_token")
+        if process_start_token is not None and (
+            _optional_process_start_token(process_start_token) is None
+        ):
+            raise ActiveSessionRegistryError(
+                f"active session registry contains an invalid process start token: {path}"
+            )
     return valid
 
 
@@ -295,15 +302,33 @@ def _write_entries(path: Path, entries: list[dict[str, Any]]) -> None:
             pass
 
 
-def _process_start_time(pid: int) -> Optional[float]:
-    # Pair pid with process create_time when psutil can read it, so a recycled
-    # pid does not keep a stale lease alive indefinitely.
-    try:
-        import psutil  # type: ignore
+def _process_start_token(pid: int) -> Optional[str]:
+    """Return Hermes' stable, platform-local process fingerprint.
 
-        return float(psutil.Process(pid).create_time())
+    The token deliberately stays opaque in the registry. On Linux it is the
+    string form of ``/proc/<pid>/stat`` field 22; on platforms without
+    ``/proc`` it is the string form of the quantized value returned by
+    ``gateway.status.get_process_start_time``. Producer and consumer must use
+    that same helper and compare the token exactly.
+    """
+    try:
+        from gateway.status import get_process_start_time
+
+        value = get_process_start_time(pid)
     except Exception:
         return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return str(value)
+
+
+def _optional_process_start_token(value: Any) -> Optional[str]:
+    """Validate an opaque registry token without assuming platform units."""
+    if not isinstance(value, str) or not value or len(value) > 256:
+        return None
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return None
+    return value
 
 
 def _optional_float(value: Any) -> Optional[float]:
@@ -315,7 +340,7 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
 
 
-def _pid_liveness(pid: Any, process_start_time: Any = None) -> Optional[bool]:
+def _pid_liveness(pid: Any, process_start_token: Any = None) -> Optional[bool]:
     """Return True/False for live/dead, or None when liveness is unknowable."""
     try:
         pid_int = int(pid)
@@ -331,16 +356,16 @@ def _pid_liveness(pid: Any, process_start_time: Any = None) -> Optional[bool]:
         return None
     if not exists:
         return False
-    expected_start = _optional_float(process_start_time)
-    if expected_start is None:
+    expected_token = _optional_process_start_token(process_start_token)
+    if expected_token is None:
         return True
-    current_start = _process_start_time(pid_int)
-    if current_start is None:
+    current_token = _process_start_token(pid_int)
+    if current_token is None:
         return None
-    return abs(current_start - expected_start) < 0.001
+    return current_token == expected_token
 
 
-def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
+def _pid_alive(pid: Any, process_start_token: Any = None) -> bool:
     try:
         pid_int = int(pid)
     except (TypeError, ValueError):
@@ -355,13 +380,16 @@ def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
         return False
     if not exists:
         return False
-    expected_start = _optional_float(process_start_time)
-    if expected_start is None:
+    expected_token = _optional_process_start_token(process_start_token)
+    if expected_token is None:
+        # Legacy/malformed entries cannot prove PID identity. Keep a live PID's
+        # slot conservatively instead of pruning it and bypassing the session
+        # cap; H3 independently treats the same entry as uncertain.
         return True
-    current_start = _process_start_time(pid_int)
-    if current_start is None:
+    current_token = _process_start_token(pid_int)
+    if current_token is None:
         return True
-    return abs(current_start - expected_start) < 0.001
+    return current_token == expected_token
 
 
 def _prune_dead(
@@ -371,7 +399,7 @@ def _prune_dead(
     for entry in entries:
         tracked = bool(entry.get("track_liveness"))
         if strict or tracked:
-            state = _pid_liveness(entry.get("pid"), entry.get("process_start_time"))
+            state = _pid_liveness(entry.get("pid"), entry.get("process_start_token"))
             if state is None:
                 raise ActiveSessionRegistryError(
                     "active session owner liveness is unknown"
@@ -379,7 +407,7 @@ def _prune_dead(
             if state:
                 live.append(entry)
             continue
-        if _pid_alive(entry.get("pid"), entry.get("process_start_time")):
+        if _pid_alive(entry.get("pid"), entry.get("process_start_token")):
             live.append(entry)
     return live
 
@@ -421,7 +449,7 @@ def _lease_entry(
         "session_id": str(session_id),
         "surface": str(surface),
         "pid": os.getpid(),
-        "process_start_time": _process_start_time(os.getpid()),
+        "process_start_token": _process_start_token(os.getpid()),
         "started_at": now,
         "updated_at": now,
     }

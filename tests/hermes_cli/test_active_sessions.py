@@ -39,6 +39,49 @@ def test_resolve_max_concurrent_sessions_values(caplog):
     )
 
 
+def test_process_start_token_matches_linux_proc_identity():
+    stat_path = Path(f"/proc/{os.getpid()}/stat")
+    if not stat_path.exists():
+        pytest.skip("Linux /proc process identity is unavailable")
+
+    expected = stat_path.read_text(encoding="utf-8").split()[21]
+    assert active_sessions._process_start_token(os.getpid()) == expected
+
+
+def test_pid_alive_compares_process_start_token_exactly(monkeypatch):
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr(active_sessions, "_process_start_token", lambda _pid: "200")
+
+    assert active_sessions._pid_alive(123, "200") is True
+    assert active_sessions._pid_alive(123, "100") is False
+
+
+def test_pid_alive_keeps_legacy_entry_conservatively(monkeypatch):
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr(active_sessions, "_process_start_token", lambda _pid: "200")
+
+    assert active_sessions._pid_alive(123, None) is True
+    assert active_sessions._pid_alive(123, 200) is True
+
+
+def test_acquire_writes_only_the_stable_process_start_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(active_sessions, "_process_start_token", lambda _pid: "stable")
+
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="feishu:group:123",
+        surface="feishu",
+        config={"max_concurrent_sessions": 1},
+    )
+
+    assert message is None
+    assert lease is not None
+    entries = active_sessions._read_entries(active_sessions._state_path())
+    assert entries[0]["process_start_token"] == "stable"
+    assert "process_start_time" not in entries[0]
+    lease.release()
+
+
 
 
 
@@ -310,6 +353,8 @@ def test_strict_registry_rejects_structurally_invalid_entries(tmp_path, monkeypa
         {**base, "metadata": []},
         {**base, "process_start_time": "not-a-number"},
         {**base, "process_start_time": "nan"},
+        {**base, "process_start_token": 123},
+        {**base, "process_start_token": "bad\nvalue"},
     )
 
     for entry in invalid_entries:
@@ -559,4 +604,3 @@ def test_release_wins_against_transfer_waiting_on_same_lease_lock(
     assert transfer_result == [False]
     assert lease.released is True
     assert active_sessions.active_session_registry_snapshot() == []
-
