@@ -748,6 +748,10 @@ class TestByteLayerBinaryDetection:
         # Error near the end but the prefix itself is not clean UTF-8.
         assert file_ops._is_likely_binary_bytes(b"\xff\xfe" + b"a" * 10 + b"\xe4") is True
 
+    def test_invalid_start_byte_at_sample_boundary_is_binary(self, file_ops):
+        sample = b"a" * 999 + b"\xff"
+        assert file_ops._is_likely_binary_bytes(sample) is True
+
     # --- transport: _sample_file_bytes ------------------------------------
 
     def test_sample_decodes_base64_transport(self, mock_env):
