@@ -2550,6 +2550,7 @@ class CredentialPool:
                     error_context=error_context,
                     api_key_hint=api_key_hint,
                     credential_id=credential_id,
+                    failure_reason=failure_reason,
                 )
 
     def _mark_exhausted_and_rotate_unlocked(
@@ -2559,6 +2560,7 @@ class CredentialPool:
         error_context: Optional[Dict[str, Any]] = None,
         api_key_hint: Optional[str] = None,
         credential_id: Optional[str] = None,
+        failure_reason: Optional[str] = None,
     ) -> Optional[PooledCredential]:
         with self._lock:
             entry = None

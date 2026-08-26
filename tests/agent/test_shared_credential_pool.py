@@ -199,6 +199,34 @@ def test_stale_shared_request_adopts_new_token_without_exhausting(tmp_path, monk
     assert entry["refresh_token"] == "refresh-new"
 
 
+def test_shared_rotation_persists_classified_failure_reason(tmp_path, monkeypatch):
+    root, _profile = _setup_shared_profile(
+        tmp_path,
+        monkeypatch,
+        [_api_key_entry("account-a", 0), _api_key_entry("account-b", 1)],
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    rotated = pool.mark_exhausted_and_rotate(
+        status_code=403,
+        credential_id="account-a",
+        failure_reason="billing",
+    )
+
+    assert rotated is not None
+    assert rotated.id == "account-b"
+    persisted = json.loads((root / "auth.json").read_text())
+    failed = next(
+        entry
+        for entry in persisted["credential_pool"]["openai-codex"]
+        if entry["id"] == "account-a"
+    )
+    assert failed["last_status"] == "exhausted"
+    assert failed["failure_reason"] == "billing"
+
+
 def test_terminal_refresh_marks_shared_manual_credential_dead(tmp_path, monkeypatch):
     expired_access = _jwt(int(time.time()) - 60, "expired")
     root, _profile = _setup_shared_profile(tmp_path, monkeypatch, [{
