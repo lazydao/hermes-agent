@@ -1360,6 +1360,22 @@ locks by widening the tree-kill.
   authorizes interrupting that work; restart only the approved profiles and
   verify both the new process identity and Feishu connection state afterward.
 
+### Reviewed Changes May Be Committed and Pushed
+
+- For changes the user explicitly requested to implement or fix, unless the
+  user limits the task to local changes only, review the actual diff before
+  committing. The review may be performed by OpenCode, Claude, or the current
+  executor. A self-review must explicitly examine scope, risk, verification
+  evidence, and unresolved findings; passing tests alone is not a completed
+  review.
+- A clear passing review, the repository-required verification passing in the
+  current run, a commit scope containing only the current task, confirmed
+  ownership of the remote, and a safely synchronizable branch together
+  authorize one commit and push for that task without another confirmation.
+  If any condition is missing, do not commit or push. This convention does not
+  authorize core edits, gateway restarts, merges, releases, deployments, force
+  pushes, history rewrites, or inclusion of unrelated dirty work.
+
 ### Fork Upstream Sync Policy
 
 This checkout is maintained through the `lazydao/hermes-agent` fork. Normal
