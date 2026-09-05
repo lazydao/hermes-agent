@@ -636,16 +636,18 @@ def transfer_active_session(
         return updated
 
 
-def release_orphaned_leases(live_lease_ids: set[str]) -> int:
-    """Drop this process's registry entries that no live session owns.
+def release_orphaned_leases(live_lease_ids: set[str], *, owner: str) -> int:
+    """Drop only this owner's unclaimed registry entries in this process.
 
     ``_prune_dead`` only reclaims leases whose owning process died. A server
     that runs for days (``hermes dashboard`` / ``serve``) never trips that
     check, so a lease whose session skipped teardown is held until restart.
-    The owning process is the only authority on which of its own leases are
-    real, so it drops the rest itself — exact, with no heartbeat write on the
-    turn path and no staleness threshold to tune.
+    One process can host both the TUI and messaging gateway. Each caller only
+    knows its own live sessions, so an explicit owner tag is required before
+    it can reclaim an entry. Untagged entries are conservatively preserved.
     """
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError("orphaned lease cleanup requires an explicit owner")
     pid = os.getpid()
     state_path = _state_path()
     # With the cap disabled the registry is never written, so don't take a lock
@@ -665,6 +667,7 @@ def release_orphaned_leases(live_lease_ids: set[str]) -> int:
             entry
             for entry in entries
             if entry.get("pid") != pid
+            or (entry.get("metadata") or {}).get("lease_owner") != owner
             or str(entry.get("lease_id") or "") in live_lease_ids
         ]
         dropped = len(entries) - len(kept)

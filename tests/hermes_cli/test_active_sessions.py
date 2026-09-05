@@ -196,7 +196,8 @@ def test_release_orphaned_leases_reclaims_only_unowned_own_pid_entries(tmp_path,
     cfg = {"max_concurrent_sessions": 5}
     kept, orphan = (
         active_sessions.try_acquire_active_session(
-            session_id=sid, surface="desktop", config=cfg
+            session_id=sid, surface="desktop", config=cfg,
+            metadata={"lease_owner": "tui_gateway"},
         )[0]
         for sid in ("kept", "orphaned")
     )
@@ -207,12 +208,55 @@ def test_release_orphaned_leases_reclaims_only_unowned_own_pid_entries(tmp_path,
         + [{"lease_id": "elsewhere", "session_id": "other", "surface": "cli", "pid": os.getpid() }],
     )
 
-    assert active_sessions.release_orphaned_leases({kept.lease_id, "elsewhere"}) == 1
+    assert active_sessions.release_orphaned_leases(
+        {kept.lease_id, "elsewhere"}, owner="tui_gateway"
+    ) == 1
     assert sorted(
         entry["session_id"]
         for entry in active_sessions.active_session_registry_snapshot()
     ) == ["kept", "other"]
     assert orphan is not None
+
+
+def test_orphan_cleanup_preserves_other_owners_and_unknown_entries(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cfg = {"max_concurrent_sessions": 10}
+    leases = []
+    for sid, surface, metadata in (
+        ("orphaned-tui", "desktop", {"lease_owner": "tui_gateway"}),
+        ("live-feishu", "gateway:feishu", {"platform": "feishu"}),
+        ("other-owner", "desktop", {"lease_owner": "other_backend"}),
+        ("legacy", "desktop", None),
+    ):
+        lease, error = active_sessions.try_acquire_active_session(
+            session_id=sid, surface=surface, config=cfg, metadata=metadata
+        )
+        assert error is None
+        leases.append(lease)
+
+    # A sibling process's tagged entry must not be reclaimed either.
+    entries = active_sessions.active_session_registry_snapshot()
+    sibling = dict(entries[0], lease_id="sibling-lease", session_id="sibling")
+    sibling.update(
+        pid=os.getppid(),
+        process_start_token=active_sessions._process_start_token(os.getppid()),
+    )
+    active_sessions._write_entries(active_sessions._state_path(), entries + [sibling])
+
+    assert active_sessions.release_orphaned_leases(set(), owner="tui_gateway") == 1
+    assert {e["session_id"] for e in active_sessions.active_session_registry_snapshot()} == {
+        "live-feishu", "other-owner", "legacy", "sibling",
+    }
+    leases[1].release()
+    assert "live-feishu" not in {
+        e["session_id"] for e in active_sessions.active_session_registry_snapshot()
+    }
+
+
+@pytest.mark.parametrize("owner", [None, "", " "])
+def test_orphan_cleanup_rejects_missing_owner(owner):
+    with pytest.raises(ValueError, match="explicit owner"):
+        active_sessions.release_orphaned_leases(set(), owner=owner)
 
 
 def test_release_under_profile_home_override_targets_acquisition_registry(

@@ -659,7 +659,7 @@ def _claim_active_session_slot(
             session_id=session_key,
             surface=surface,
             config=_load_cfg(),
-            metadata={"live_session_id": live_session_id},
+            metadata={"live_session_id": live_session_id, "lease_owner": "tui_gateway"},
             registry_home=profile_home,
             track_liveness=track_liveness,
         )
@@ -802,7 +802,7 @@ def _transfer_active_session_slot(
         if transfer_active_session(
             lease,
             session_id=new_session_id,
-            metadata={"live_session_id": sid},
+            metadata={"live_session_id": sid, "lease_owner": "tui_gateway"},
         ):
             return True
     except Exception:
@@ -1846,7 +1846,7 @@ def _reap_idle_sessions() -> None:
 
 
 def _reclaim_orphaned_leases() -> None:
-    """Hand the registry the lease ids we still own so it can drop the rest."""
+    """Reclaim only TUI-owned leases; this PID may also host the gateway."""
     try:
         from hermes_cli.active_sessions import release_orphaned_leases
 
@@ -1856,7 +1856,7 @@ def _reclaim_orphaned_leases() -> None:
                 for session in _sessions.values()
                 if (lease := session.get("active_session_lease")) is not None
             }
-        if dropped := release_orphaned_leases(live):
+        if dropped := release_orphaned_leases(live, owner="tui_gateway"):
             logger.info("Reclaimed %d orphaned active-session lease(s)", dropped)
     except Exception:
         logger.debug("orphaned lease reclaim failed", exc_info=True)
