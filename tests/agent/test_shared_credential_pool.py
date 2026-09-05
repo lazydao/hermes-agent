@@ -259,3 +259,67 @@ def test_terminal_refresh_marks_shared_manual_credential_dead(tmp_path, monkeypa
     entry = persisted["credential_pool"]["openai-codex"][0]
     assert entry["last_status"] == "dead"
     assert entry["last_error_reason"] == "invalid_grant"
+
+
+def test_profile_preference_does_not_reorder_shared_pool(tmp_path, monkeypatch):
+    root, profile = _setup_shared_profile(
+        tmp_path, monkeypatch,
+        [_api_key_entry("account-a", 0), _api_key_entry("account-b", 1)],
+    )
+    from agent.credential_pool import load_pool
+
+    config = (
+        "credential_pool_sharing:\n  openai-codex: global\n"
+        "credential_pool_strategies:\n  openai-codex: fill_first\n"
+    )
+    (root / "config.yaml").write_text(config)
+    for name in ("client", "serverrun"):
+        target = root / "profiles" / name
+        target.mkdir(exist_ok=True)
+        (target / "config.yaml").write_text(
+            config + "credential_pool_preferred:\n  openai-codex: account-b\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(target))
+        pool = load_pool("openai-codex")
+        assert pool.peek().id == "account-b"
+        assert pool.select().id == "account-b"
+        assert pool.acquire_lease() == "account-b"
+        pool.release_lease("account-b")
+        assert pool.acquire_lease("account-a") == "account-a"
+    # Model the unpreferred default configuration without pointing the test
+    # at Path.home()/.hermes, which the auth-store safety guard forbids.
+    unpreferred = root / "profiles" / "unpreferred"
+    unpreferred.mkdir()
+    (unpreferred / "config.yaml").write_text(config)
+    monkeypatch.setenv("HERMES_HOME", str(unpreferred))
+    assert load_pool("openai-codex").select().id == "account-a"
+    persisted = json.loads((root / "auth.json").read_text())
+    assert [(e["id"], e["priority"]) for e in persisted["credential_pool"]["openai-codex"]] == [
+        ("account-a", 0), ("account-b", 1),
+    ]
+
+
+def test_profile_preference_respects_shared_failure_and_recovery(tmp_path, monkeypatch):
+    root, profile = _setup_shared_profile(
+        tmp_path, monkeypatch,
+        [_api_key_entry("account-a", 0), _api_key_entry("account-b", 1)],
+    )
+    (profile / "config.yaml").write_text(
+        "credential_pool_sharing:\n  openai-codex: global\n"
+        "credential_pool_preferred:\n  openai-codex: account-b\n"
+    )
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    assert pool.select().id == "account-b"
+    assert pool.mark_exhausted_and_rotate(
+        status_code=403, credential_id="account-b", failure_reason="billing",
+    ).id == "account-a"
+    assert pool.acquire_lease() == "account-a"
+    data = json.loads((root / "auth.json").read_text())
+    data["credential_pool"]["openai-codex"][1]["last_status"] = "ok"
+    (root / "auth.json").write_text(json.dumps(data))
+    assert pool.select().id == "account-b"
+    data["credential_pool"]["openai-codex"] = data["credential_pool"]["openai-codex"][:1]
+    (root / "auth.json").write_text(json.dumps(data))
+    assert pool.select().id == "account-a"

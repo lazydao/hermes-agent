@@ -157,6 +157,23 @@ profile-local entries for that provider remain on disk but are intentionally
 ignored so a profile cannot silently fall back to credentials outside the
 shared pool. Disabling the setting makes those local entries visible again.
 
+### Prefer an account in one profile
+
+With `fill_first`, a profile can prefer a credential by its pool entry ID while
+continuing to share tokens, refresh locks and cooldowns with other profiles:
+
+```yaml
+credential_pool_preferred:
+  openai-codex: "account-entry-id"
+```
+
+This changes the profile's selection view, not the shared priority order.
+If the entry is missing or unavailable, existing failover selection applies.
+It also applies to automatic lease selection among entries below the soft
+concurrency cap; explicitly requested leases retain their selected account.
+Other rotation strategies ignore this preference. Restart a running gateway
+to apply a changed preference to its existing pools.
+
 ## Error Recovery
 
 The pool handles different errors differently:

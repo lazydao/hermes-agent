@@ -5518,6 +5518,7 @@ _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
     "providers",
     "credential_pool_strategies",
     "credential_pool_sharing",
+    "credential_pool_preferred",
     "mcp_servers",
     "hooks",
     "quick_commands",

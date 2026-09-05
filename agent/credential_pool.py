@@ -726,6 +726,10 @@ class CredentialPool:
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
+        config = _load_config_safe() or {}
+        preferences = config.get("credential_pool_preferred", {})
+        preferred = preferences.get(provider) if isinstance(preferences, dict) else None
+        self._preferred_id = preferred.strip() if isinstance(preferred, str) else ""
         # RLock: the mutation primitives below (_replace_entry/_persist)
         # self-acquire this lock so the DEFERRED single-use-token refresh
         # path (which runs network I/O outside the lock by design) still
@@ -2428,6 +2432,9 @@ class CredentialPool:
             self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
             self._persist(removed_ids=entries_to_prune)
+        # Reorder only this selection view, never the shared persisted priority.
+        if self._strategy == STRATEGY_FILL_FIRST and self._preferred_id:
+            available.sort(key=lambda entry: entry.id != self._preferred_id)
         return available, pending_refresh
 
     def _log_no_available_entries(self) -> None:
@@ -2766,7 +2773,13 @@ class CredentialPool:
                 candidates = below_cap if below_cap else available
                 chosen = min(
                     candidates,
-                    key=lambda entry: (self._active_leases.get(entry.id, 0), entry.priority),
+                    key=lambda entry: (
+                        self._strategy == STRATEGY_FILL_FIRST
+                        and bool(self._preferred_id)
+                        and entry.id != self._preferred_id,
+                        self._active_leases.get(entry.id, 0),
+                        entry.priority,
+                    ),
                 )
                 self._active_leases[chosen.id] = self._active_leases.get(chosen.id, 0) + 1
                 self._current_id = chosen.id
