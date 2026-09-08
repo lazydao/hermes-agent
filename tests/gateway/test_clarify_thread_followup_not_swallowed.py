@@ -264,3 +264,25 @@ async def test_prose_still_accepted_after_other_flips_text_capture():
     assert entry.response == "a carousel actually"
     _clear_clarify_state()
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply,accepted", [("1", True), ("99", False)])
+async def test_only_resolved_text_reply_links_processing_reaction(reply, accepted):
+    from unittest.mock import AsyncMock
+    from tools import clarify_gateway as cm
+
+    _clear_clarify_state()
+    adapter = _StubAdapter()
+    adapter.note_clarify_answer_accepted = AsyncMock()
+    runner = _make_runner(adapter)
+    cm.register("reaction-choice", SESSION_KEY, "Pick one", ["A", "B"])
+    answer = _event(reply)
+    try:
+        assert await _dispatch(runner, answer) == ""
+        if accepted:
+            adapter.note_clarify_answer_accepted.assert_awaited_once_with(SESSION_KEY, answer)
+        else:
+            adapter.note_clarify_answer_accepted.assert_not_awaited()
+    finally:
+        _clear_clarify_state()

@@ -3035,6 +3035,16 @@ def _strip_media_directives(text: str) -> str:
     return _strip_media_tag_directives(text)
 
 
+@dataclass
+class _ClarifyReactionTurn:
+    """Reaction ownership follows one processing invocation, even across reset."""
+
+    original_message_id: str
+    events: Dict[str, MessageEvent] = field(default_factory=dict)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    outcome: Optional[ProcessingOutcome] = None
+
+
 class BasePlatformAdapter(ABC):
     """
     Base class for platform adapters.
@@ -3267,6 +3277,7 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        self._clarify_reaction_turns: Dict[str, _ClarifyReactionTurn] = {}
         # Dynamic working-state status text per chat (chat_id -> phrase).
         # Set by the gateway on tool starts ("is running pytest…") and read
         # by adapters whose typing indicator renders text (Slack's
@@ -5620,9 +5631,61 @@ class BasePlatformAdapter(ABC):
     # ``_remove_reaction(chat_id, message_id)`` shape can set these class
     # attributes instead of overriding the hook. Left as ``None`` the hook
     # stays a no-op (historical default).
+    link_clarify_reactions: bool = False
+
     _ACK_EMOJI: Optional[str] = None
     _OK_EMOJI: Optional[str] = None
     _FAIL_EMOJI: Optional[str] = None
+
+    async def note_clarify_answer_accepted(self, session_key: str, event: MessageEvent) -> None:
+        """Link an accepted reply to the original task, not its empty ack."""
+        self.resume_typing_for_chat(event.source.chat_id)
+        if not self.link_clarify_reactions or not event.message_id:
+            return
+        turn = self._clarify_reaction_turns.get(session_key)
+        if turn is None or event.message_id == turn.original_message_id:
+            return
+        # Completion can run while the platform reaction request is in flight.
+        # Serialize it with start so it cannot remove a not-yet-created badge.
+        async with turn.lock:
+            if turn.outcome is not None or event.message_id in turn.events:
+                return
+            turn.events[event.message_id] = event
+            await self._run_processing_hook("on_processing_start", event)
+
+    async def _complete_clarify_reactions(
+        self, session_key: str, turn: Optional[_ClarifyReactionTurn], outcome: ProcessingOutcome,
+    ) -> None:
+        if turn is None:
+            return
+
+        async def finish() -> None:
+            async with turn.lock:
+                if turn.outcome is not None:
+                    return
+                turn.outcome = outcome
+                if self._clarify_reaction_turns.get(session_key) is turn:
+                    self._clarify_reaction_turns.pop(session_key)
+                events = list(turn.events.values())
+                turn.events.clear()
+                for answer in events:
+                    await self._run_processing_hook("on_processing_complete", answer, outcome)
+
+        # Reset may cancel the owner while a removal request is in flight.
+        # Finish cleanup before propagating cancellation, rather
+        # than orphaning the remaining reactions after claiming completion.
+        cleanup = asyncio.create_task(finish())
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError:
+                if cleanup.cancelled():
+                    raise
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
@@ -6613,7 +6676,11 @@ class BasePlatformAdapter(ABC):
         # Fall back to a new Event only if the entry was removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
-        
+        clarify_turn = None
+        if self.link_clarify_reactions:
+            clarify_turn = _ClarifyReactionTurn(event.message_id)
+            self._clarify_reaction_turns[session_key] = clarify_turn
+
         # Start continuous typing indicator (refreshes every 2 seconds).
         # Gated per-platform: when typing_indicator=False the refresh loop is
         # never spawned, so no "typing…" / "is thinking…" status is shown.
@@ -7075,6 +7142,10 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+            await self._complete_clarify_reactions(
+                session_key, clarify_turn,
+                ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
+            )
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
@@ -7126,9 +7197,11 @@ class BasePlatformAdapter(ABC):
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
             await self._run_processing_hook("on_processing_complete", event, outcome)
+            await self._complete_clarify_reactions(session_key, clarify_turn, outcome)
             raise
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+            await self._complete_clarify_reactions(session_key, clarify_turn, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:

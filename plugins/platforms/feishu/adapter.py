@@ -3452,6 +3452,8 @@ class FeishuAdapter(BasePlatformAdapter):
     def _pop_processing_reaction(self, message_id: str) -> Optional[str]:
         return self._pending_processing_reactions.pop(message_id, None)
 
+    link_clarify_reactions = True
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         if not self._reactions_enabled():
             return
