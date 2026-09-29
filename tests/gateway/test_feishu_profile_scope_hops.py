@@ -60,8 +60,9 @@ def test_drive_comment_agent_turn_runs_under_the_adapter_profile_scope(routed_sc
 
     seen = {}
 
-    def _fake_agent(prompt, client, session_key=""):
+    def _fake_agent(prompt, client, session_key="", user_id=""):
         seen["turn"] = _observe(routed_scope)
+        seen["user_id"] = user_id
         return "NO_REPLY"
 
     event = SimpleNamespace(event={
@@ -80,6 +81,7 @@ def test_drive_comment_agent_turn_runs_under_the_adapter_profile_scope(routed_sc
         asyncio.run(fc.handle_drive_comment_event(object(), event, self_open_id="ou_bot"))
 
     assert seen["turn"] == ("routed", "routed-value")
+    assert seen["user_id"] == "ou_user"
 
 
 def test_drive_comment_agent_turn_binds_the_unscoped_launch_profile(tmp_path):
