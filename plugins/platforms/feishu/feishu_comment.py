@@ -1,6 +1,7 @@
 """Feishu/Lark drive document comment handling (``drive.notice.comment_add_v1`` → Drive v1/v2 comment APIs).
 Flow: parse event -> access check -> OK reaction -> parallel fetch (doc meta + comment) -> timeline (whole-doc comments
-or local thread replies) -> prompt -> AIAgent with feishu_doc + feishu_drive tools -> deliver reply (whole ->
+or local thread replies) -> prompt -> AIAgent with the profile's Feishu toolsets, project context/SOUL and the
+commenter's identity -> deliver reply (whole ->
 add_whole_comment; local -> reply_to_comment, falling back to add_whole_comment on 1069302)."""
 
 from __future__ import annotations
@@ -486,8 +487,23 @@ def _save_session_history(key: str, messages: List[Dict[str, Any]]) -> None:
         logger.info("[Feishu-Comment] Session saved: %s (%d messages)", key, len(cleaned))
 
 
-def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
-    """Create an AIAgent with feishu tools and run the prompt; empty string on failure. *session_key*, if given, loads/saves history for cross-card memory in the same document."""
+def _resolve_comment_agent_toolsets() -> Tuple[List[str], Optional[List[str]]]:
+    """``(enabled, disabled)`` toolsets a normal Feishu turn gets, from the serving profile's config
+    (``platform_toolsets.feishu`` / ``agent.disabled_toolsets``). The doc/drive toolsets this flow
+    exists for are always enabled unless explicitly disabled."""
+    from agent.skill_utils import parse_config_string_list
+    from gateway.run import _load_gateway_config
+    from hermes_cli.tools_config import _get_platform_tools
+    user_config = _load_gateway_config()
+    enabled = sorted(_get_platform_tools(user_config, "feishu") | {"feishu_doc", "feishu_drive"})
+    disabled = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets")) or None
+    return enabled, disabled
+
+
+def _run_comment_agent(prompt: str, client: Any, session_key: str = "", user_id: str = "") -> str:
+    """Create an AIAgent with the configured Feishu tools, project context/SOUL and the commenter's
+    identity, and run the prompt; empty string on failure. *session_key*, if given, loads/saves history
+    for cross-card memory in the same document."""
     from run_agent import AIAgent
     from tools import feishu_doc_tool, feishu_drive_tool
     logger.info("[Feishu-Comment] _run_comment_agent: injecting lark client into tool thread-locals")
@@ -496,12 +512,15 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
         mod.set_client(client)
     try:
         model, runtime_kwargs = _resolve_model_and_runtime()
+        enabled_toolsets, disabled_toolsets = _resolve_comment_agent_toolsets()
         logger.info("[Feishu-Comment] _run_comment_agent: model=%s provider=%s base_url=%s", model, runtime_kwargs.get("provider"), (runtime_kwargs.get("base_url") or "")[:50])
         history = _load_session_history(session_key) if session_key else []
         if history:
             logger.info("[Feishu-Comment] _run_comment_agent: loaded %d history messages from session %s", len(history), session_key)
         agent = AIAgent(model=model, **{k: runtime_kwargs.get(k) for k in ("base_url", "api_key", "provider", "api_mode", "credential_pool", "reasoning_config")},
-                        quiet_mode=True, skip_context_files=True, skip_memory=True, max_iterations=15, enabled_toolsets=["feishu_doc", "feishu_drive"])
+                        quiet_mode=True, skip_context_files=False, load_soul_identity=True, skip_memory=True, max_iterations=15,
+                        enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets, platform="feishu",
+                        user_id=user_id or None, chat_type="document_comment", gateway_session_key=session_key or None)
         logger.info("[Feishu-Comment] _run_comment_agent: calling run_conversation (prompt=%d chars, history=%d)", len(prompt), len(history))
         result = agent.run_conversation(prompt, conversation_history=history or None)
         response = (result.get("final_response") or "").strip()
@@ -515,6 +534,25 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
     finally:
         for mod in tool_mods:
             mod.set_client(None)
+
+
+def _run_comment_agent_with_context(prompt: str, client: Any, session_key: str = "", user_id: str = "") -> str:
+    """Run the comment agent with the commenter's Feishu identity bound for local tools (terminal,
+    approvals, ``HERMES_SESSION_*``). Runs inside the caller's copied context, so the profile is the
+    serving adapter's under multiplex."""
+    from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
+    reset_session_vars()
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        profile = get_active_profile_name()
+    except Exception:
+        profile = ""
+    tokens = set_session_vars(platform="feishu", chat_type="document_comment", user_id=user_id,
+                              session_key=session_key, profile=profile, async_delivery=False, cron_session="")
+    try:
+        return _run_comment_agent(prompt, client, session_key, user_id)
+    finally:
+        clear_session_vars(tokens)
 
 
 def _last_index_where(timeline: Timeline, pred) -> Optional[Tuple[str, int]]:
@@ -617,7 +655,8 @@ async def handle_drive_comment_event(client: Any, data: Any, *, self_open_id: st
     # with an EMPTY context: model/credential resolution and the AIAgent would then run under the
     # LAUNCH profile (UnscopedSecretError, or the default profile's config/model/state). Carry it.
     response = await asyncio.get_running_loop().run_in_executor(
-        None, contextvars.copy_context().run, _run_comment_agent, prompt, client, _session_key(file_type, file_token))
+        None, contextvars.copy_context().run, _run_comment_agent_with_context, prompt, client,
+        _session_key(file_type, file_token), from_open_id)
     if not response or _NO_REPLY_SENTINEL in response:
         logger.info("[Feishu-Comment] Agent returned NO_REPLY, skipping delivery")
     else:

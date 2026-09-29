@@ -182,6 +182,8 @@ async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> byt
 
 
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
+_FEISHU_STALE_THREAD_CODE = 99992402  # thread_id create route rejected: the topic is gone/stale
+_STALE_THREAD_FALLBACK_NOTICE = "原话题已失效，回复转发至群聊"
 
 # Feishu reactions render as prominent badges, unlike Discord/Telegram's
 # small footer emoji — a success badge on every message would add noise, so
@@ -1660,11 +1662,14 @@ class FeishuAdapter(BasePlatformAdapter):
         prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
         last_response = None
 
+        def _plain_payload(chunk: str) -> str:
+            return json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False)
+
         async def _send_plain(chunk: str) -> Any:
             return await self._feishu_send_with_retry(
                 chat_id=chat_id,
                 msg_type="text",
-                payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                payload=_plain_payload(chunk),
                 reply_to=reply_to,
                 metadata=metadata,
             )
@@ -1680,6 +1685,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
                         raise
                     logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                    msg_type, payload = "text", _plain_payload(chunk)
                     response = await _send_plain(chunk)
                 if (
                     msg_type == "post"
@@ -1687,13 +1693,47 @@ class FeishuAdapter(BasePlatformAdapter):
                     and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
                 ):
                     logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
+                    msg_type, payload = "text", _plain_payload(chunk)
                     response = await _send_plain(chunk)
+                if (not self._response_succeeded(response)
+                        and getattr(response, "code", None) == _FEISHU_STALE_THREAD_CODE
+                        and (metadata or {}).get("thread_id")):
+                    # Later chunks follow the recovered route instead of retrying the stale topic.
+                    response, reply_to, metadata = await self._recover_stale_thread_send(
+                        chat_id=chat_id, chunk=chunk, msg_type=msg_type, payload=payload, metadata=metadata)
                 last_response = response
 
             return self._finalize_send_result(last_response, "send failed")
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def _recover_stale_thread_send(
+        self, *, chat_id: str, chunk: str, msg_type: str, payload: str, metadata: Dict[str, Any],
+    ) -> tuple[Any, Optional[str], Optional[Dict[str, Any]]]:
+        """Recover a ``thread_id`` create rejected as stale (99992402): reply to the thread's latest
+        message to stay in the topic, else send once to the chat with a notice. Returns the response
+        and the ``(reply_to, metadata)`` route later chunks of the same reply should use."""
+        thread_id = str(metadata["thread_id"])
+        anchor = metadata.get("reply_to_message_id") or await self._fetch_last_message_in_thread(thread_id)
+        if anchor:
+            logger.info("[Feishu] Thread %s is stale for create routing; retrying as reply to %s", thread_id, anchor)
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id, msg_type=msg_type, payload=payload, reply_to=str(anchor), metadata=metadata)
+            if self._response_succeeded(response):
+                return response, str(anchor), metadata
+        logger.warning("[Feishu] Thread %s delivery failed; forwarding reply to chat %s", thread_id, chat_id)
+        if msg_type == "post":
+            msg_type, payload = self._build_outbound_payload(
+                f"{_STALE_THREAD_FALLBACK_NOTICE}\n\n{chunk}", prefer_post=True)
+        else:
+            # Plain text, also when a rejected post was downgraded: never resurrect the post here.
+            msg_type, payload = "text", json.dumps(
+                {"text": f"{_STALE_THREAD_FALLBACK_NOTICE}\n\n{_strip_markdown_to_plain_text(chunk)}"},
+                ensure_ascii=False)
+        response = await self._feishu_send_with_retry(
+            chat_id=chat_id, msg_type=msg_type, payload=payload, reply_to=None, metadata=None)
+        return response, None, None
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         """Edit a previously sent Feishu text/post message."""
@@ -3712,7 +3752,9 @@ class FeishuAdapter(BasePlatformAdapter):
             return None
         try:
             from lark_oapi.api.im.v1 import ListMessageRequest
-            request = ListMessageRequest.builder().container_id_type("thread").container_id(thread_id).page_size(1).build()
+            # Newest first: the default ascending order returns the topic's first message.
+            request = (ListMessageRequest.builder().container_id_type("thread").container_id(thread_id)
+                       .sort_type("ByCreateTimeDesc").page_size(1).build())
             response = await self._run_blocking(self._client.im.v1.message.list, request)
             if self._response_succeeded(response):
                 items = getattr(getattr(response, "data", None), "items", None)
