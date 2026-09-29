@@ -39,6 +39,7 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
         adapter_profile=kw.get("adapter_profile"),
+        reply_to_message_id=kw.get("reply_to_message_id"),
     )
 
 
@@ -123,7 +124,7 @@ class TestSchemaMigration:
         finally:
             conn.close()
 
-        assert "adapter_profile" in columns
+        assert {"adapter_profile", "reply_to_message_id"} <= columns
 
 
 class TestStateMachine:
@@ -174,6 +175,12 @@ class TestRuntimeFailedSweep:
         assert claimed[0]["needs_marker"] is True
         assert claimed[0]["attempts"] == 1
         assert _row("ob-1")["state"] == "attempting"
+
+    def test_runtime_claim_keeps_reply_anchor(self):
+        _record(platform="telegram", reply_to_message_id="msg-42")
+        dl.mark_failed("ob-1", "send_path_degraded")
+
+        assert [r["reply_to_message_id"] for r in dl.sweep_failed_for_runtime("telegram")] == ["msg-42"]
 
     def test_permanent_failure_is_not_claimed(self):
         _record(platform="telegram")
@@ -413,7 +420,7 @@ class TestGatewayRedeliverySweep:
 
     @pytest.mark.asyncio
     async def test_pending_redelivers_plain_and_clears_resume(self):
-        _record()  # pending
+        _record(reply_to_message_id="msg-42")  # pending
         _orphan("ob-1")
         adapter = self._adapter()
         runner = self._runner(adapter)
@@ -423,6 +430,7 @@ class TestGatewayRedeliverySweep:
         assert n == 1
         sent = adapter.send.call_args.kwargs
         assert sent["content"] == "the final answer"  # no marker
+        assert sent["reply_to"] == "msg-42"
         assert sent["metadata"] == {"thread_id": "171.001"}
         assert _row("ob-1")["state"] == "delivered"
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
@@ -541,7 +549,7 @@ class TestGatewayRedeliverySweep:
     async def test_runtime_failed_redelivery_clears_resume_before_send(self):
         from gateway.config import Platform
 
-        _record(platform="slack")
+        _record(platform="slack", reply_to_message_id="msg-42")
         dl.mark_failed("ob-1", "send_path_degraded")
         adapter = self._adapter()
         runner = self._runner(adapter)
@@ -556,6 +564,7 @@ class TestGatewayRedeliverySweep:
         assert adapter.send.call_args.kwargs["content"].startswith(
             dl.RECONNECTED_MARKER
         )
+        assert adapter.send.call_args.kwargs["reply_to"] == "msg-42"
         assert _row("ob-1")["state"] == "delivered"
 
     @pytest.mark.asyncio
