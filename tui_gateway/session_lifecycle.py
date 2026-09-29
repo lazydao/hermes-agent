@@ -60,10 +60,16 @@ _SESSION_OWNERSHIP_UNAVAILABLE = "Hermes could not safely reserve this session. 
 _AUTOMATIC_SESSION_END_REASONS = frozenset({"ws_orphan_reap", "ws_disconnect", "idle_timeout", "lru_evict", "tui_shutdown"})
 
 
+# ``metadata.lease_owner`` of every TUI/Desktop lease: this PID may also host the messaging gateway, so the
+# orphan sweep and automatic-cleanup guards reclaim only leases carrying this tag.
+_LEASE_OWNER = "tui_gateway"
+
+
 def _lease_metadata(live_session_id: str) -> dict:
-    """Writer identity for a lease: ``live_session_id`` is half of ``_is_same_writer``. Bot Chat delivery is
-    admitted by the session authority (gateway/session_bot), never gated on a lease flag."""
-    return {"live_session_id": live_session_id}
+    """Writer identity for a lease: ``live_session_id`` is half of ``_is_same_writer``; ``lease_owner`` scopes
+    orphan cleanup. Bot Chat delivery is admitted by the session authority (gateway/session_bot), never gated
+    on a lease flag."""
+    return {"live_session_id": live_session_id, "lease_owner": _LEASE_OWNER}
 
 
 def _claim_active_session_slot(
@@ -335,10 +341,12 @@ def _other_runtime_lease_guard(session_id: str, session: dict):
     def _enter() -> None:
         stack.close()  # drop anything a half-failed previous attempt left behind
         if lease is not None and getattr(lease, "enabled", False):
-            guard = release_active_session_liveness_guard(lease, session_id, own_live_lease_ids=own_live_lease_ids)
+            guard = release_active_session_liveness_guard(
+                lease, session_id, own_live_lease_ids=own_live_lease_ids, owner=_LEASE_OWNER)
         else:
             guard = active_session_liveness_guard(
-                session_id, registry_home=session.get("profile_home"), own_live_lease_ids=own_live_lease_ids)
+                session_id, registry_home=session.get("profile_home"), own_live_lease_ids=own_live_lease_ids,
+                owner=_LEASE_OWNER)
         active[:] = [stack.enter_context(guard)]
 
     if (last_error := _lease_retry(3, _enter)) is not None:

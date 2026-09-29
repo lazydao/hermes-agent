@@ -10,6 +10,10 @@ import pytest
 from hermes_cli import active_sessions
 
 
+# Orphan cleanup reclaims only leases tagged with the sweeping backend's owner.
+_OWNER = "tui_gateway"
+_OWNED = {"lease_owner": _OWNER}
+
 
 def _backdate_leases(*homes, age_seconds=600.0):
     """Age every lease in the given registries past the self-orphan grace."""
@@ -209,7 +213,7 @@ def test_release_orphaned_leases_reclaims_only_unowned_own_pid_entries(tmp_path,
     cfg = {"max_concurrent_sessions": 5}
     kept, orphan = (
         active_sessions.try_acquire_active_session(
-            session_id=sid, surface="desktop", config=cfg
+            session_id=sid, surface="desktop", config=cfg, metadata=_OWNED,
         )[0]
         for sid in ("kept", "orphaned")
     )
@@ -221,7 +225,9 @@ def test_release_orphaned_leases_reclaims_only_unowned_own_pid_entries(tmp_path,
     )
 
     _backdate_leases(tmp_path / ".hermes")
-    assert active_sessions.release_orphaned_leases({kept.lease_id, "elsewhere"}) == 1
+    assert active_sessions.release_orphaned_leases(
+        {kept.lease_id, "elsewhere"}, owner=_OWNER
+    ) == 1
     assert sorted(
         entry["session_id"]
         for entry in active_sessions.active_session_registry_snapshot()
@@ -239,22 +245,24 @@ def test_release_orphaned_leases_sweeps_profile_runtime_registries(
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     root_lease, root_error = active_sessions.try_acquire_active_session(
-        session_id="root-orphan", surface="desktop", config={}, registry_home=root
+        session_id="root-orphan", surface="desktop", config={}, registry_home=root,
+        metadata=_OWNED,
     )
     profile_lease, profile_error = active_sessions.try_acquire_active_session(
         session_id="profile-orphan",
         surface="desktop",
         config={},
         registry_home=profile,
+        metadata=_OWNED,
     )
     assert root_lease is not None and root_error is None
     assert profile_lease is not None and profile_error is None
 
     # A lease written seconds ago is never an orphan: a sibling finalize that
     # snapshotted its live ids before this acquire must not reap it (#101415).
-    assert active_sessions.release_orphaned_leases(set()) == 0
+    assert active_sessions.release_orphaned_leases(set(), owner=_OWNER) == 0
     _backdate_leases(root, profile)
-    assert active_sessions.release_orphaned_leases(set()) == 2
+    assert active_sessions.release_orphaned_leases(set(), owner=_OWNER) == 2
     assert active_sessions.active_session_registry_snapshot(root) == []
     assert active_sessions.active_session_registry_snapshot(profile) == []
 
@@ -262,13 +270,59 @@ def test_release_orphaned_leases_sweeps_profile_runtime_registries(
 def test_drop_self_orphans_spares_foreign_and_vouched_leases():
     own = os.getpid()
     entries = [
-        {"lease_id": "orphan", "pid": own},
-        {"lease_id": "live", "pid": own},
-        {"lease_id": "foreign", "pid": own + 1},
+        {"lease_id": "orphan", "pid": own, "metadata": _OWNED},
+        {"lease_id": "live", "pid": own, "metadata": _OWNED},
+        {"lease_id": "foreign", "pid": own + 1, "metadata": _OWNED},
     ]
 
     assert active_sessions._drop_self_orphans(entries, None) == entries
-    assert active_sessions._drop_self_orphans(entries, {"live"}) == entries[1:]
+    assert active_sessions._drop_self_orphans(entries, {"live"}, _OWNER) == entries[1:]
+
+
+def test_orphan_cleanup_preserves_other_owners_and_unknown_entries(tmp_path, monkeypatch):
+    """One process can host the TUI backend and the messaging gateway; the TUI sweep
+    must only reclaim its own tagged leases, never a same-PID gateway or legacy one."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cfg = {"max_concurrent_sessions": 10}
+    leases = []
+    for sid, surface, metadata in (
+        ("orphaned-tui", "desktop", _OWNED),
+        ("live-feishu", "gateway:feishu", {"platform": "feishu", "lease_owner": "gateway"}),
+        ("other-owner", "desktop", {"lease_owner": "other_backend"}),
+        ("legacy", "desktop", None),
+    ):
+        lease, error = active_sessions.try_acquire_active_session(
+            session_id=sid, surface=surface, config=cfg, metadata=metadata
+        )
+        assert error is None
+        leases.append(lease)
+
+    # A sibling process's tagged entry must not be reclaimed either.
+    entries = active_sessions.active_session_registry_snapshot()
+    sibling = dict(entries[0], lease_id="sibling-lease", session_id="sibling")
+    sibling.update(
+        pid=os.getppid(),
+        process_start_token=active_sessions._process_start_token(os.getppid()),
+    )
+    active_sessions._write_entries(active_sessions._state_path(), entries + [sibling])
+    _backdate_leases(tmp_path)
+
+    assert active_sessions.release_orphaned_leases(set(), owner=_OWNER) == 1
+    assert {e["session_id"] for e in active_sessions.active_session_registry_snapshot()} == {
+        "live-feishu", "other-owner", "legacy", "sibling",
+    }
+    leases[1].release()
+    assert "live-feishu" not in {
+        e["session_id"] for e in active_sessions.active_session_registry_snapshot()
+    }
+
+
+@pytest.mark.parametrize("owner", [None, "", " "])
+def test_orphan_cleanup_rejects_missing_owner(owner):
+    with pytest.raises(ValueError, match="explicit owner"):
+        active_sessions.release_orphaned_leases(set(), owner=owner)
+    with pytest.raises(ValueError, match="explicit owner"):
+        active_sessions._drop_self_orphans([], set(), owner)
 
 
 def test_release_under_profile_home_override_targets_acquisition_registry(
@@ -585,11 +639,12 @@ def test_unknown_sibling_does_not_block_guarded_release_or_orphan_sweep(tmp_path
     )
     lease, message = active_sessions.try_acquire_active_session(
         session_id="new-chat", surface="desktop", config={}, track_liveness=True,
+        metadata=_OWNED,
     )
     assert lease is not None and message is None
 
     with active_sessions.release_active_session_liveness_guard(
-        lease, "new-chat", own_live_lease_ids=set()
+        lease, "new-chat", own_live_lease_ids=set(), owner=_OWNER
     ) as active:
         assert active is False
     assert lease.released is True
@@ -599,10 +654,11 @@ def test_unknown_sibling_does_not_block_guarded_release_or_orphan_sweep(tmp_path
 
     orphan, _ = active_sessions.try_acquire_active_session(
         session_id="orphaned", surface="desktop", config={}, track_liveness=True,
+        metadata=_OWNED,
     )
     assert orphan is not None
     _backdate_leases(home)
-    assert active_sessions._release_orphaned_leases_in_home(home, set()) == 1
+    assert active_sessions._release_orphaned_leases_in_home(home, set(), _OWNER) == 1
     assert [e["lease_id"] for e in active_sessions._read_entries(state_path)] == ["stale-sibling"]
 
 
@@ -757,19 +813,20 @@ def test_liveness_guard_keeps_a_just_acquired_own_lease_it_cannot_vouch_for(
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
     fresh, error = active_sessions.try_acquire_active_session(
-        session_id="fresh", surface="desktop", config={}, registry_home=home
+        session_id="fresh", surface="desktop", config={}, registry_home=home,
+        metadata=_OWNED,
     )
     assert fresh is not None and error is None
 
     with active_sessions.active_session_liveness_guard(
-        "fresh", registry_home=home, own_live_lease_ids=set()
+        "fresh", registry_home=home, own_live_lease_ids=set(), owner=_OWNER
     ) as active:
         assert active is True
     assert [e["lease_id"] for e in active_sessions.active_session_registry_snapshot(home)] == [fresh.lease_id]
 
     _backdate_leases(home)
     with active_sessions.active_session_liveness_guard(
-        "fresh", registry_home=home, own_live_lease_ids=set()
+        "fresh", registry_home=home, own_live_lease_ids=set(), owner=_OWNER
     ) as active:
         assert active is False
     assert active_sessions.active_session_registry_snapshot(home) == []
