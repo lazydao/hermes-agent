@@ -2929,9 +2929,16 @@ class GatewayTurnMixin:
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: SessionSource, session_id: str, **turn_kwargs,
     ) -> Dict[str, Any]:
-        """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
-        when multiplexing is off)."""
-        with self._profile_scope_for_source(source):
+        """Per-turn message-id and profile-scoping wrapper around ``_run_agent_inner`` (same keyword
+        parameters; profile scope is a pass-through when multiplexing is off).
+
+        ``_set_session_env`` binds ``HERMES_SESSION_MESSAGE_ID`` once for the inbound event, but a
+        queued follow-up recurses through here with its own source; rebind the anchor per turn with
+        the same definition (the turn source's ``message_id``) so tools in the follow-up (process
+        watchers, cron origin, kanban) anchor on the message that triggered THIS turn."""
+        from gateway.session_context import session_message_id_scope
+        message_id = str(source.message_id) if getattr(source, "message_id", None) else ""
+        with session_message_id_scope(message_id), self._profile_scope_for_source(source):
             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":

@@ -1,5 +1,6 @@
 import asyncio
 import os
+from contextlib import nullcontext
 
 import pytest
 
@@ -114,6 +115,71 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     assert get_session_env("HERMES_SESSION_USER_ID") == ""
     assert get_session_env("HERMES_SESSION_USER_NAME") == ""
     assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
+
+
+def _feishu_source(message_id=None):
+    return SessionSource(
+        platform=Platform.FEISHU, chat_id="oc_chat", chat_type="dm", user_id="ou_user", message_id=message_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_binds_each_turns_message_id_and_restores_the_outer_one(monkeypatch):
+    """A queued follow-up recurses through ``_run_agent`` with its own source: it must run under
+    ITS triggering message id (the reply anchor), not the first message's, and the outer value
+    must be restored afterwards."""
+    runner = object.__new__(GatewayRunner)
+    observed = []
+
+    async def fake_run_agent_inner(message, *args, **kwargs):
+        observed.append((message, get_session_env("HERMES_SESSION_MESSAGE_ID")))
+        if message == "first":
+            await runner._run_agent("queued", "", [], _feishu_source("om_second"), "session-1")
+            observed.append(("first-after", get_session_env("HERMES_SESSION_MESSAGE_ID")))
+        return {"final_response": "ok"}
+
+    monkeypatch.setattr(runner, "_run_agent_inner", fake_run_agent_inner)
+    monkeypatch.setattr(runner, "_profile_scope_for_source", lambda _source: nullcontext())
+    tokens = set_session_vars(message_id="outer-message")
+    try:
+        await runner._run_agent("first", "", [], _feishu_source("om_first"), "session-1")
+        assert get_session_env("HERMES_SESSION_MESSAGE_ID") == "outer-message"
+        # A source without a message id (steer/interrupt text re-uses the outer source; an
+        # internal wake may carry none) binds exactly what _set_session_env would: "".
+        await runner._run_agent("anchorless", "", [], _feishu_source(), "session-1")
+    finally:
+        clear_session_vars(tokens)
+
+    assert observed == [
+        ("first", "om_first"), ("queued", "om_second"), ("first-after", "om_first"), ("anchorless", ""),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_run_agent_message_ids_are_isolated(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    both_entered = asyncio.Event()
+    entered = 0
+    observed = {}
+
+    async def fake_run_agent_inner(message, *args, **kwargs):
+        nonlocal entered
+        observed[message] = [get_session_env("HERMES_SESSION_MESSAGE_ID")]
+        entered += 1
+        if entered == 2:
+            both_entered.set()
+        await asyncio.wait_for(both_entered.wait(), timeout=1)
+        observed[message].append(get_session_env("HERMES_SESSION_MESSAGE_ID"))
+        return {"final_response": "ok"}
+
+    monkeypatch.setattr(runner, "_run_agent_inner", fake_run_agent_inner)
+    monkeypatch.setattr(runner, "_profile_scope_for_source", lambda _source: nullcontext())
+    await asyncio.gather(
+        runner._run_agent("first", "", [], _feishu_source("om_first"), "session-1"),
+        runner._run_agent("second", "", [], _feishu_source("om_second"), "session-2"),
+    )
+
+    assert observed == {"first": ["om_first", "om_first"], "second": ["om_second", "om_second"]}
 
 
 def test_get_session_env_falls_back_to_os_environ(monkeypatch):
@@ -316,3 +382,56 @@ async def test_plugin_slash_command_sees_session_env(monkeypatch):
     # Bound only for the handler call, not leaked past dispatch
     assert get_session_env("HERMES_SESSION_KEY") == ""
 
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_turn_sees_its_own_message_id_in_the_agent_thread(monkeypatch, tmp_path):
+    """End to end through the turn worker: the agent (tool) thread of a queued follow-up reads
+    the follow-up's triggering message id, not the first message's."""
+    import importlib
+    import sys
+    import types
+
+    from gateway.platforms.event import MessageEvent, MessageType
+    from tests.gateway.test_run_progress_topics import ProgressCaptureAdapter, _make_runner
+
+    seen = []
+
+    class _Agent:
+        def __init__(self, **kwargs):
+            self.tools = []
+
+        def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+            seen.append((message, get_session_env("HERMES_SESSION_MESSAGE_ID")))
+            return {"final_response": "ok", "messages": [], "api_calls": 1, "completed": True}
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _Agent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+
+    def _source(message_id):
+        return SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group", message_id=message_id)
+
+    session_key = "agent:main:telegram:group:-1001"
+    adapter._pending_messages[session_key] = MessageEvent(
+        text="second", message_type=MessageType.TEXT, source=_source("m-2"), message_id="m-2",
+    )
+    tokens = set_session_vars(message_id="m-1")
+    try:
+        await runner._run_agent(
+            message="first", context_prompt="", history=[], source=_source("m-1"),
+            session_id="sess-msg-id", session_key=session_key,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert seen == [("first", "m-1"), ("second", "m-2")]
