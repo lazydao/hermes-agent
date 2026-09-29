@@ -243,7 +243,9 @@ def apply_pre_response_gate(
         # failed the gate.
         message = fallback
     final_msg["content"] = message
-    # A promoted-reasoning sidecar would replay the withheld text on the wire.
-    final_msg.pop("api_content", None)
+    # A promoted-reasoning sidecar or a provider-native carrier (replayed verbatim in preference to
+    # ``content`` on later turns) would put the withheld text back on the wire.
+    for key in ("api_content", "codex_message_items", "anthropic_content_blocks", "bedrock_content_blocks"):
+        final_msg.pop(key, None)
     final_msg["finish_reason"] = "response_hook_replace"
     return PreResponseVerdict(False, message, pending_pre_response_fallback)
