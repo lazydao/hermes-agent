@@ -444,7 +444,8 @@ class GatewayStartupMixin:
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                result = await adapter.send(chat_id=row["chat_id"], content=content,
+                                            reply_to=row.get("reply_to_message_id"), metadata=metadata)
             except Exception as send_err:
                 logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
                 result = None
@@ -743,8 +744,8 @@ class GatewayStartupMixin:
             started = started_at.timestamp()  # aware UTC marker; a pre-upgrade naive one reads as local
             if started < cutoff:
                 continue
-            text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
-                                          started, origin)
+            history = await self.async_session_store.load_transcript(session_id)
+            text = self._crash_left_reply(history, started, origin)
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:
@@ -752,10 +753,23 @@ class GatewayStartupMixin:
                     record_crash_left_reply,
                     obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
                     platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
-                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile)
+                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile,
+                    reply_to_message_id=self._crash_left_reply_anchor(history, origin))
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered
+
+    @staticmethod
+    def _crash_left_reply_anchor(history: list, origin) -> Optional[str]:
+        """Reply anchor for a crash-left reply, rebuilt from the turn's persisted prompt id as live
+        delivery derives it. A quoted-message or busy-redirect anchor is not persisted, so such a turn
+        anchors on its own prompt."""
+        from gateway.platforms.base import _reply_anchor_for_event
+        prompt = next((m for m in reversed(history) if m.get("role") == "user"), {})
+        message_id = prompt.get("message_id") or prompt.get("platform_message_id")
+        if not message_id:
+            return None
+        return _reply_anchor_for_event(MessageEvent(text="", source=origin, message_id=str(message_id)))
 
     def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
         """What a crash-left turn owes, judged as live delivery would have: ``None`` when it never

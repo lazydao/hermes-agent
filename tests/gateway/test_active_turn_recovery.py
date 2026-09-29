@@ -501,15 +501,15 @@ async def test_unclean_restart_delivers_a_persisted_unledgered_reply_instead_of_
     from gateway.delivery_ledger import sweep_recoverable
 
     runner, store = _db_runner(tmp_path)
-    source = _turn(store, "replied", marked=True, reply="the stored answer")
+    source = _turn(store, "replied", marked=True, reply="the stored answer", message_id="msg-7")
 
     assert await runner._recover_unclean_sessions() == (0, 1)
 
     entry = _entry_for(store, source)
     assert (entry.resume_pending, entry.active_turn_token) == (False, None)
     rows = sweep_recoverable(deliverable_platforms={"discord"})
-    assert [(r["content"], r["needs_marker"], r["chat_id"], r["thread_id"]) for r in rows] == [
-        ("the stored answer", True, "replied", "thread-1")]
+    assert [(r["content"], r["needs_marker"], r["chat_id"], r["thread_id"], r["reply_to_message_id"])
+            for r in rows] == [("the stored answer", True, "replied", "thread-1", "msg-7")]
     _close_store_db(store)
 
 
