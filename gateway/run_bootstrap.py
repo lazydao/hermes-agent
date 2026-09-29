@@ -173,7 +173,7 @@ def _start_gateway_configure_logging(verbosity: Optional[int]) -> None:
 
 def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdown: list):
     """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
-    from gateway.run import (_best_effort, _hermes_home, asyncio, logger, signal)
+    from gateway.run import (_best_effort, _hermes_home, asyncio, logger, os, signal)
     planned_stop_seen = [False]
 
     def shutdown_signal_handler(received_signal=None):
@@ -235,7 +235,21 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             # here, and a sibling-driven --replace takeover is not launchd-timed either, so both
             # keep the configured drain. _stop_impl uses this to cap the drain to the live budget.
             runner._stop_requested_by_signal = True
-        asyncio.create_task(runner.stop())
+        unplanned = not (planned_takeover or planned_stop)
+        if not (unplanned and received_signal == signal.SIGTERM and os.environ.get("INVOCATION_ID")):
+            asyncio.create_task(runner.stop())
+            return
+
+        async def _stop_after_systemd_check() -> None:
+            # `systemctl stop|restart` of this unit owns the relaunch decision: a clean exit, not a
+            # failed-unit transition. Decided before stop() so _stop_impl persists gateway_state.
+            from gateway.run import _systemd_is_stopping_self
+            if await _systemd_is_stopping_self():
+                _signal_initiated_shutdown[0] = runner._signal_initiated_shutdown = False
+                logger.info("SIGTERM is a systemd stop/restart of this unit — exiting cleanly")
+            await runner.stop()
+
+        asyncio.create_task(_stop_after_systemd_check())
     return shutdown_signal_handler
 
 

@@ -2636,6 +2636,32 @@ def _request_chain_budget_for_followup(
     return None
 
 
+def _should_suppress_same_turn_polled_process_completion(
+    result: Any, pending_event: MessageEvent | None, current_message_id: Any,
+) -> bool:
+    """Drop a queued completion turn the finishing turn already covered: the internal event reports
+    ONE background process started from the same triggering message, and this turn succeeded with
+    a visible answer after observing that process's exit via ``poll()``. ``poll()`` stays read-only
+    for every other case (another message, a failed/empty turn, a coalesced batch)."""
+    if (
+        pending_event is None or not bool(getattr(pending_event, "internal", False))
+        or not _should_clear_resume_pending_after_turn(result or {})
+        or not str((result or {}).get("final_response") or "").strip()
+    ):
+        return False
+    from gateway.run_notifications import BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY
+    metadata = getattr(pending_event, "metadata", None)
+    process_id = str((metadata or {}).get(BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY) or "").strip()
+    # Synthetic completions carry no reply anchor; the triggering message id rides metadata.
+    origin_message_id = str(
+        (metadata or {}).get("original_trigger_message_id") or getattr(pending_event, "message_id", None) or ""
+    ).strip()
+    if not process_id or not origin_message_id or origin_message_id != str(current_message_id or "").strip():
+        return False
+    from tools.process_registry import process_registry
+    return process_registry.was_completion_polled(process_id)
+
+
 def _should_defer_internal_iteration_limit_response(result: Any, pending_event: MessageEvent | None) -> bool:
     """Hold a max-iterations handoff while the queued INTERNAL continuation runs: the chain's
     final answer supersedes it. A real user follow-up still gets the handoff first."""
@@ -4883,6 +4909,45 @@ def _start_gateway_make_restart_signal_handler(runner):
             "config reload.")
         runner.request_restart(detached=False, via_service=True)
     return restart_signal_handler
+
+
+def _systemd_service_unit_of_self(cgroup_text: Optional[str] = None) -> Optional[tuple[str, bool]]:
+    """``(unit, user_manager)`` for the ``*.service`` this process runs in (cgroup v2 path), else None."""
+    if cgroup_text is None:
+        try:
+            cgroup_text = Path("/proc/self/cgroup").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+    for line in cgroup_text.splitlines():
+        path = line.split(":", 2)[-1]
+        units = [part for part in path.split("/") if part.endswith(".service")]
+        if units:
+            return units[-1], any(part.startswith("user@") for part in path.split("/")[:-1])
+    return None
+
+
+async def _systemd_is_stopping_self(timeout: float = 2.0) -> bool:
+    """True only when systemd itself is stopping/restarting THIS unit: its SIGTERM follows the unit
+    entering ``ActiveState=deactivating``, while a bare ``kill -TERM`` / ``systemctl kill`` leaves
+    the unit ``active``. Unknown (no unit, no systemctl, timeout) is False — keep the failure path."""
+    if not os.environ.get("INVOCATION_ID"):
+        return False
+    owner = _systemd_service_unit_of_self()
+    if owner is None:
+        return False
+    unit, user_manager = owner
+    argv = ["systemctl", *(["--user"] if user_manager else []), "show", unit, "--property=ActiveState", "--value"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        except TimeoutError:
+            proc.kill()
+            return False
+    except (OSError, ValueError):
+        return False
+    return stdout.decode(errors="replace").strip() == "deactivating"
 
 
 def _claim_host_gateway_role(force: bool = False) -> None:

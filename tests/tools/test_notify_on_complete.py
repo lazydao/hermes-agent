@@ -281,9 +281,12 @@ class TestCompletionConsumed:
         s.exit_code = 0
         registry._finished[s.id] = s
 
+        assert not registry.was_completion_polled("proc_gw")
         registry.poll("proc_gw")
-        # The gateway watcher gate is untouched, so it still delivers.
+        # The gateway watcher gate is untouched, so it still delivers; only the narrower
+        # same-turn dedupe signal records the observed exit.
         assert not registry.is_completion_consumed("proc_gw")
+        assert registry.was_completion_polled("proc_gw")
 
 
     def test_wait_and_log_still_skip_cli_drain(self, registry):

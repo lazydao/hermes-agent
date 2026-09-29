@@ -1706,7 +1706,10 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         """Dequeue the adapter's pending / interrupt / leftover-steer follow-up as ``(pending_event, pending)``.
 
         Keyed by session_key (not source.chat_id) to match the adapter's storage keys."""
-        from gateway.run import _build_media_placeholder, _dequeue_pending_event, _is_control_interrupt_message
+        from gateway.run import (
+            _build_media_placeholder, _dequeue_pending_event, _is_control_interrupt_message,
+            _should_suppress_same_turn_polled_process_completion,
+        )
         from gateway.session_ingress import executing_admission
         pending_event = None
         pending = None
@@ -1715,6 +1718,14 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             if result.get("compression_exhausted") and pending_event is not None:
                 self._defer_past_exhaustion_reset(result, adapter, source, session_key, pending_event)
                 return None, None
+            if _should_suppress_same_turn_polled_process_completion(
+                result, pending_event, getattr(source, "message_id", None),
+            ):
+                logger.info(
+                    "Suppressing queued completion turn for %s: this turn already polled it to exit",
+                    pending_event.metadata.get("background_process_completion_session_id"),
+                )
+                pending_event = None
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)

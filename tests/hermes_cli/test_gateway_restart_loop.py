@@ -1068,6 +1068,65 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    @staticmethod
+    def _scan_with_remote(command, remote_text):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        remote_reads = []
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            command, read_remote_script=lambda path: remote_reads.append(path) or remote_text,
+        )
+        return result, remote_reads
+
+    def test_local_binary_does_not_fall_back_to_remote_reader(self, tmp_path):
+        binary = tmp_path / "tool"
+        binary.write_bytes(b"\x7fELF\x00hermes gateway restart")
+        binary.chmod(0o755)
+
+        assert self._scan_with_remote(str(binary), "hermes gateway restart") == (False, [])
+
+    def test_local_directory_does_not_fall_back_to_remote_reader(self, tmp_path):
+        assert self._scan_with_remote(f"bash {tmp_path}", "hermes gateway restart") == (False, [])
+
+    def test_missing_local_script_can_still_use_remote_reader(self, tmp_path):
+        missing = tmp_path / "remote-only.sh"
+
+        assert self._scan_with_remote(str(missing), "hermes gateway restart") == (True, [str(missing)])
+
+    def test_unreadable_local_script_fails_closed_without_remote_reader(self, tmp_path, monkeypatch):
+        from cron import lifecycle_guard
+
+        script = tmp_path / "blocked.sh"
+        script.write_text("echo safe", encoding="utf-8")
+        real_open = lifecycle_guard.os.open
+
+        def denied_open(path, flags, *args):
+            if str(path) == str(script):
+                raise PermissionError(13, "denied")
+            return real_open(path, flags, *args)
+
+        monkeypatch.setattr(lifecycle_guard.os, "open", denied_open)
+
+        unsafe, refusal = lifecycle_guard.scan_gateway_lifecycle(
+            str(script), cwd=None, read_remote_script=lambda _p: pytest.fail("remote read"),
+        )
+        assert unsafe is True
+        assert refusal and str(script) in refusal
+
+    def test_over_long_local_path_is_not_forwarded_to_remote_reader(self, tmp_path):
+        long_path = str(tmp_path / ("x" * 300)) + ".sh"
+
+        assert self._scan_with_remote(long_path, "hermes gateway restart") == (False, [])
+
+    def test_remote_binary_content_is_not_recursively_scanned(self, tmp_path):
+        missing = tmp_path / "remote-binary"
+
+        assert self._scan_with_remote(str(missing), "\x7fELF\x00hermes gateway restart")[0] is False
+
+    def test_nul_path_never_reaches_remote_reader(self, tmp_path):
+        """Covered at ingestion by ``_expand_candidate_path`` (no extra check in the reader)."""
+        assert self._scan_with_remote(f"{tmp_path}/bad\x00path.sh", "unsafe") == (False, [])
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
