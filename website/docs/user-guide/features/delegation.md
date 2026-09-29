@@ -634,6 +634,7 @@ error.
 # In ~/.hermes/config.yaml
 delegation:
   max_iterations: 250                       # Max turns per child (default: 250)
+  continuation_reserve_iterations: 0        # Parent iterations retained for async completion on shared request-budget frontends (currently the messaging gateway; CLI/TUI use fresh completion budgets). 0 disables.
   # max_concurrent_children: 10             # Parallel children per batch (default: 10)
   # independent_completions: false          # true = each task/group returns as it finishes (default: one message per call)
   # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)

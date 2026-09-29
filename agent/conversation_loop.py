@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
-from agent.iteration_budget import IterationBudget
+from agent.iteration_budget import IterationBudget, restore_foreground_iteration_cap
 from agent.message_metadata import append_message
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
@@ -1638,23 +1638,28 @@ def run_conversation(
 
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
-    with native_turn_images(user_message):
-        result = _run_conversation_turn(
-            agent,
-            user_message,
-            system_message=system_message,
-            conversation_history=conversation_history,
-            task_id=task_id,
-            stream_callback=stream_callback,
-            persist_user_message=persist_user_message,
-            persist_user_timestamp=persist_user_timestamp,
-            persist_user_display_kind=persist_user_display_kind,
-            persist_user_display_metadata=persist_user_display_metadata,
-            persist_user_platform_id=persist_user_platform_id,
-            moa_config=moa_config,
-            turn_author=turn_author,
-            iteration_budget=iteration_budget,
-        )
+    # A foreground cap applied by an async dispatch this turn ends with the turn on EVERY exit
+    # (return, early return, exception), after finalize_turn has read it.
+    try:
+        with native_turn_images(user_message):
+            result = _run_conversation_turn(
+                agent,
+                user_message,
+                system_message=system_message,
+                conversation_history=conversation_history,
+                task_id=task_id,
+                stream_callback=stream_callback,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_platform_id=persist_user_platform_id,
+                moa_config=moa_config,
+                turn_author=turn_author,
+                iteration_budget=iteration_budget,
+            )
+    finally:
+        restore_foreground_iteration_cap(agent)
     result = export_current_turn_boundary(agent, result, user_message)
     _close_durable_failed_turn(agent, result)
     return result

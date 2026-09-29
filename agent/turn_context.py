@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from agent.conversation_compression import recover_rotated_compression_session
-from agent.iteration_budget import IterationBudget
+from agent.iteration_budget import IterationBudget, restore_foreground_iteration_cap
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
 from agent.message_content import flatten_message_text
@@ -607,10 +607,15 @@ def _reset_per_turn_agent_state(agent: Any, iteration_budget: Optional[Iteration
         agent._replay_compression_warning()
         agent._compression_warning = None  # send once
 
+    # A foreground cap (delegation.continuation_reserve_iterations) belongs to one turn only.
+    restore_foreground_iteration_cap(agent)
     agent.iteration_budget = (
         iteration_budget if isinstance(iteration_budget, IterationBudget)
         else IterationBudget(agent.max_iterations)
     )
+    # Only a shared request budget reaches the async completion turn, so only then is reserving
+    # part of it for that turn meaningful (see delegate_tool_dispatch).
+    agent._async_completion_uses_shared_budget = isinstance(iteration_budget, IterationBudget)
     # Wall-clock run budget: stamped only when configured (one wrap-up notice per run).
     agent._run_budget_started_at = (
         time.time() if getattr(agent, "run_budget_seconds", None) else None

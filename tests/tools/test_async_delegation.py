@@ -152,6 +152,97 @@ def test_async_executor_workers_are_daemon_threads():
     assert _drain_one() is not None
 
 
+def _budget_with_used(max_total, used):
+    from agent.iteration_budget import IterationBudget
+
+    budget = IterationBudget(max_total)
+    for _ in range(used):
+        assert budget.consume()
+    return budget
+
+
+def _reserve_parent(*, calls, shared=True, cap=90):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        max_iterations=cap, _api_call_count=calls, _async_completion_uses_shared_budget=shared,
+        iteration_budget=_budget_with_used(90, calls),
+    )
+
+
+@pytest.mark.parametrize("calls, shared, expected", [
+    (10, True, (70, 20)),     # cap the foreground, total stays 90
+    (85, True, (86, 4)),      # late dispatch: the reserve shrinks, the foreground keeps one call
+    (10, False, (None, 0)),   # CLI/TUI: the completion starts fresh, nothing to reserve
+])
+def test_completion_reserve_plan(monkeypatch, calls, shared, expected):
+    import tools.delegate_tool as dt
+    from tools.delegate_tool_dispatch import _plan_async_completion_reserve
+
+    monkeypatch.setattr(dt, "_load_config", lambda: {"continuation_reserve_iterations": 20})
+    parent = _reserve_parent(calls=calls, shared=shared)
+
+    assert _plan_async_completion_reserve(parent) == expected
+    assert (parent.max_iterations, parent.iteration_budget.max_total) == (90, 90)
+
+
+def test_completion_reserve_is_read_per_serving_profile(monkeypatch, tmp_path):
+    """Multiplexed gateway: each turn runs under its profile's HERMES_HOME override, and the reserve
+    comes from THAT profile's config (A -> B -> A), not a process-global value."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.delegate_tool_config import _get_continuation_reserve_iterations
+
+    monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
+    homes = {}
+    for name, reserve in (("default", 20), ("client", 5)):
+        home = tmp_path / name
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            f"delegation:\n  continuation_reserve_iterations: {reserve}\n", encoding="utf-8")
+        homes[name] = home
+
+    seen = []
+    for name in ("default", "client", "default"):
+        token = set_hermes_home_override(homes[name])
+        try:
+            seen.append(_get_continuation_reserve_iterations())
+        finally:
+            reset_hermes_home_override(token)
+    assert seen == [20, 5, 20]
+
+
+def test_foreground_cap_is_restored():
+    from types import SimpleNamespace
+    from agent.iteration_budget import (
+        IterationBudget, apply_foreground_iteration_cap, restore_foreground_iteration_cap,
+    )
+
+    parent = SimpleNamespace(max_iterations=90, iteration_budget=IterationBudget(90))
+    apply_foreground_iteration_cap(parent, 70)
+    apply_foreground_iteration_cap(parent, 60)  # a second dispatch keeps the ORIGINAL cap
+    assert parent.max_iterations == 60
+    restore_foreground_iteration_cap(parent)
+    assert parent.max_iterations == 90
+    assert "_foreground_iteration_cap_original" not in parent.__dict__
+
+
+def test_reserve_notice_requires_a_live_shared_budget():
+    evt = {"type": "async_delegation", "delegation_id": "deleg_restored", "goal": "finish",
+           "status": "completed", "summary": "done", "completion_reserve_iterations": 20}
+    assert "Continuation budget" not in format_process_notification(evt)
+
+
+def test_reserve_notice_reports_only_the_remaining_shared_allowance():
+    from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY
+
+    evt = {"type": "async_delegation", "delegation_id": "deleg_later_sibling", "goal": "finish",
+           "status": "completed", "summary": "done", "completion_reserve_iterations": 20,
+           REQUEST_CHAIN_BUDGET_EVENT_KEY: _budget_with_used(90, 83)}
+    text = format_process_notification(evt)
+    assert "Continuation budget snapshot: 7" in text
+    assert "shared across completion turns" in text
+
+
 def test_completion_event_lands_on_shared_queue_with_session_key():
     def runner():
         return {"status": "completed", "summary": "the result",
@@ -570,6 +661,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY, IterationBudget
     parent.iteration_budget = IterationBudget(90)
     assert parent.iteration_budget.consume()
+    parent._async_completion_uses_shared_budget = True
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
@@ -593,6 +685,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", slow_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(dt, "_load_config", lambda: {"continuation_reserve_iterations": 20})
     out = dt.delegate_task(
         goal="the real task", context="ctx",
         background=True, parent_agent=parent,
@@ -603,6 +696,9 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert parsed["status"] == "dispatched"
     assert parsed["mode"] == "background"
     assert parsed["delegation_id"].startswith("deleg_")
+    # The foreground turn is capped so 20 of the shared 90 stay for the completion turn.
+    assert (parsed["completion_reserve_iterations"], parsed["foreground_iteration_cap"]) == (20, 70)
+    assert (parent.max_iterations, parent.iteration_budget.max_total) == (70, 90)
     # Non-blocking invariant: delegate_task returned while the child is STILL
     # blocked on the closed gate, so no completion event exists yet.
     assert process_registry.completion_queue.empty()
@@ -618,12 +714,14 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert evt["results"][0]["summary"] == "done: the real task"
     # The completion turn continues the dispatching request's iteration budget...
     assert evt[REQUEST_CHAIN_BUDGET_EVENT_KEY] is parent.iteration_budget
+    assert evt["completion_reserve_iterations"] == 20
     # ...but the live budget object never reaches a JSON surface (status list, durable row).
     json.dumps(ad.list_async_delegations())
     assert REQUEST_CHAIN_BUDGET_EVENT_KEY not in json.dumps(ad.get_durable_delegation(evt["delegation_id"]))
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+    assert "Continuation budget snapshot: 20" in text
 
 
 def test_task_failure_notice_carries_request_chain_budget():

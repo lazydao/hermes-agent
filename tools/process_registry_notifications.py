@@ -139,9 +139,31 @@ def _notice_lines(results) -> "list[str]":
     return ["", *notice] if notice else []
 
 
+def _completion_reserve_lines(evt: dict) -> "list[str]":
+    """Budget hint when the dispatching turn reserved part of the SHARED request budget for this
+    completion turn (delegation.continuation_reserve_iterations); [] otherwise."""
+    from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY, IterationBudget
+    reserve, budget = evt.get("completion_reserve_iterations"), evt.get(REQUEST_CHAIN_BUDGET_EVENT_KEY)
+    if not isinstance(reserve, int) or isinstance(reserve, bool) or not isinstance(budget, IterationBudget):
+        return []
+    remaining = min(reserve, budget.remaining)
+    if remaining <= 0:
+        return []
+    return [
+        f"Continuation budget snapshot: {remaining} parent iteration(s) remained when this notification was "
+        "prepared. The request-chain allowance is shared across completion turns, so fewer may be available "
+        "when this turn runs.",
+        "Use this turn to integrate the returned evidence and finish the original task's required persistence, "
+        "verification, and closure. Do not start optional scope expansion unless it is required to resolve a "
+        "concrete blocker.",
+        "",
+    ]
+
+
 def _preamble(evt: dict, title: str, intro: str, completed_at: float, *, with_goal: bool) -> "list[str]":
-    """Shared preamble: title, intro, blank, dispatch time, [goal], context/toolsets, role+model."""
-    lines = [title, intro, ""]
+    """Shared preamble: title, intro, blank, [budget hint], dispatch time, [goal], context/toolsets,
+    role+model."""
+    lines = [title, intro, "", *_completion_reserve_lines(evt)]
     dispatched_at = evt.get("dispatched_at")
     if isinstance(dispatched_at, (int, float)):
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(dispatched_at))

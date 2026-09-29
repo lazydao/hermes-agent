@@ -411,6 +411,31 @@ def _restore_parent_cancellation(unit: _Batch) -> None:
     for _, _, child in unit.children:
         _attach_child(unit.parent_agent, child)
 
+def _plan_async_completion_reserve(parent_agent) -> tuple[Optional[int], int]:
+    """``(foreground_cap, reserve)`` keeping ``delegation.continuation_reserve_iterations`` of the SHARED
+    request budget for the completion turn; ``(None, 0)`` when off or when this turn's budget does not
+    carry into the completion (CLI/TUI: the completion starts fresh, so a cap would only cost work).
+    The foreground always keeps at least one more call."""
+    from tools.delegate_tool_config import _get_continuation_reserve_iterations
+    requested = _get_continuation_reserve_iterations()
+    if requested <= 0 or getattr(parent_agent, "_async_completion_uses_shared_budget", False) is not True:
+        return None, 0
+    budget = getattr(parent_agent, "iteration_budget", None)
+    remaining = getattr(budget, "remaining", None)
+    if not isinstance(remaining, int) or isinstance(remaining, bool) or remaining <= 0:
+        return None, 0
+    calls = getattr(parent_agent, "_api_call_count", None)
+    if not isinstance(calls, int) or isinstance(calls, bool):
+        used = getattr(budget, "used", 0)
+        calls = used if isinstance(used, int) else 0
+    calls = max(0, calls)
+    current_cap = getattr(parent_agent, "max_iterations", None)
+    if not isinstance(current_cap, int) or isinstance(current_cap, bool) or current_cap <= 0:
+        current_cap = getattr(budget, "max_total", calls + remaining)
+    cap = min(current_cap, calls + max(1, remaining - requested))
+    reserve = min(requested, max(0, remaining - (cap - calls)))
+    return (cap, reserve) if reserve > 0 else (None, 0)
+
 def _dispatch_background(batch: _Batch) -> str:
     """Dispatch the call as independent async units (see ``_units_of``) and return the tool result JSON. Every unit
     of one call shares ONE pool slot (``slot_key``), so grouping never changes capacity accounting. Falls back to
@@ -431,6 +456,8 @@ def _dispatch_background(batch: _Batch) -> str:
         # The completion turn continues this request on the same iteration budget.
         request_chain_budget=request_chain_budget_of(parent_agent),
     )
+    foreground_cap, completion_reserve = _plan_async_completion_reserve(parent_agent)
+    routing["completion_reserve_iterations"] = completion_reserve
 
     units = _units_of(batch)
     dispatched: List[tuple[_Batch, str]] = []
@@ -464,6 +491,18 @@ def _dispatch_background(batch: _Batch) -> str:
     payload = _dispatched_payload(batch, dispatched)
     if inline_results:
         payload["inline_results"] = inline_results
+    if foreground_cap is not None:
+        from agent.iteration_budget import apply_foreground_iteration_cap
+        apply_foreground_iteration_cap(parent_agent, foreground_cap)
+        logger.info(
+            "delegate_task: capped the current foreground turn at %d to retain %d shared iteration(s) "
+            "for async completion", foreground_cap, completion_reserve,
+        )
+        payload.update(completion_reserve_iterations=completion_reserve, foreground_iteration_cap=foreground_cap)
+        payload["note"] += (
+            f" {completion_reserve} parent iteration(s) are reserved for integrating the completion and "
+            "finishing the original task; keep foreground work bounded and avoid optional scope expansion."
+        )
     return json.dumps(payload, ensure_ascii=False)
 
 def _run_batch(batch: _Batch, background: bool) -> str:

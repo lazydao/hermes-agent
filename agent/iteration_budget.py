@@ -63,6 +63,37 @@ class IterationBudget:
             return max(0, self.max_total - self._used)
 
 
+_FOREGROUND_CAP_ORIGINAL_ATTR = "_foreground_iteration_cap_original"
+
+
+def _positive_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def apply_foreground_iteration_cap(agent, cap: int) -> None:
+    """Lower *agent*'s loop cap (``max_iterations``) for the CURRENT turn only; the first call
+    remembers the original. Always paired with :func:`restore_foreground_iteration_cap`, which
+    ``conversation_loop.run_conversation`` runs on every exit and turn start runs again."""
+    if not _positive_int(cap):
+        return
+    state = getattr(agent, "__dict__", None)
+    if isinstance(state, dict) and _FOREGROUND_CAP_ORIGINAL_ATTR not in state:
+        original = getattr(agent, "max_iterations", None)
+        if not _positive_int(original):
+            original = getattr(getattr(agent, "iteration_budget", None), "max_total", None)
+        if _positive_int(original):
+            state[_FOREGROUND_CAP_ORIGINAL_ATTR] = original
+    agent.max_iterations = cap
+
+
+def restore_foreground_iteration_cap(agent) -> None:
+    """Undo :func:`apply_foreground_iteration_cap` (no-op when no cap is active)."""
+    state = getattr(agent, "__dict__", None)
+    original = state.pop(_FOREGROUND_CAP_ORIGINAL_ATTR, None) if isinstance(state, dict) else None
+    if _positive_int(original):
+        agent.max_iterations = original
+
+
 def request_chain_budget_of(agent) -> "IterationBudget | None":
     """The request-chain budget that owns work started by *agent*: the ROOT agent's budget. A
     delegated child's own budget (``delegation.max_iterations``) must never become the cap of the
@@ -86,6 +117,6 @@ def current_request_chain_budget() -> "IterationBudget | None":
 
 
 __all__ = [
-    "IterationBudget", "REQUEST_CHAIN_BUDGET_EVENT_KEY", "current_request_chain_budget",
-    "request_chain_budget_of",
+    "IterationBudget", "REQUEST_CHAIN_BUDGET_EVENT_KEY", "apply_foreground_iteration_cap",
+    "current_request_chain_budget", "request_chain_budget_of", "restore_foreground_iteration_cap",
 ]

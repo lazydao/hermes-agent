@@ -672,7 +672,7 @@ def _dispatch_admitted(
     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
     task_indexes: Optional[List[int]] = None,
     task_transcripts: Optional[Dict[str, str]] = None,
-    request_chain_budget: Any = None,
+    request_chain_budget: Any = None, completion_reserve_iterations: int = 0,
 ) -> Dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
@@ -702,6 +702,8 @@ def _dispatch_admitted(
         "_context": contextvars.copy_context(),
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None,
+        # Shared-budget iterations the dispatching turn left for the completion turn (hint only).
+        "completion_reserve_iterations": max(0, int(completion_reserve_iterations or 0)),
         # Process-local: the completion turn continues the dispatching request's budget. The key is
         # ``_``-prefixed, so status listings and the durable row never carry it.
         REQUEST_CHAIN_BUDGET_EVENT_KEY: request_chain_budget}
@@ -791,7 +793,7 @@ def dispatch_async_delegation_batch(
     progress_fn: Optional[Callable[[], tuple]] = None, slot_key: Optional[str] = None,
     task_indexes: Optional[List[int]] = None,
     task_transcripts: Optional[Dict[str, str]] = None,
-    request_chain_budget: Any = None,
+    request_chain_budget: Any = None, completion_reserve_iterations: int = 0,
 ) -> Dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
@@ -810,7 +812,7 @@ def dispatch_async_delegation_batch(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         task_indexes=task_indexes, task_transcripts=task_transcripts,
-        request_chain_budget=request_chain_budget,
+        request_chain_budget=request_chain_budget, completion_reserve_iterations=completion_reserve_iterations,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
@@ -882,7 +884,8 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
-        **{k: result[k] for k in _STALL_META_KEYS if k in result}}
+        **{k: result[k] for k in _STALL_META_KEYS if k in result},
+        "completion_reserve_iterations": record.get("completion_reserve_iterations", 0)}
     try:
         _persist_completion(evt, result)
     except Exception as exc:  # noqa: BLE001 — a lost durable row is recoverable; a lost result + leaked slot is not
