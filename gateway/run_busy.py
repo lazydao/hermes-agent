@@ -500,11 +500,14 @@ class GatewayBusySessionMixin:
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command.
     _PLAINTEXT_APPROVAL_WORDS: Dict[str, tuple] = {
-        **{w: ("approve", "") for w in ("approve", "yes", "ok", "okay", "confirm", "y", "👍")},
+        **{w: ("approve", "") for w in ("approve", "yes", "ok", "okay", "confirm", "y", "👍",
+                                         "确定", "确认", "同意", "允许", "批准", "允许执行")},
         **{w: ("deny", "") for w in ("deny", "no", "reject", "cancel", "n", "👎")},
         **{w: ("approve", "always") for w in ("always", "approve always", "always approve")},
         **{w: ("approve", "session") for w in ("session", "approve session", "session approve")},
     }
+    # Chinese approvals often echo the command: "允许执行 <command>" approves once.
+    _PLAINTEXT_APPROVAL_PREFIXES: tuple = ("允许执行 ", "同意执行 ", "批准执行 ")
 
     async def _route_plaintext_approval_while_busy(self, event: MessageEvent, session_key: str) -> bool:
         """Route a bare "yes"/"no" to the approval handlers while a dangerous-command approval blocks.
@@ -531,6 +534,8 @@ class GatewayBusySessionMixin:
             if event.allow_gateway_control and has_blocking_approval(session_key):
                 _raw_text = (event.text or "").strip().lower()
                 _match = self._PLAINTEXT_APPROVAL_WORDS.get(_raw_text)
+                if _match is None and _raw_text.startswith(self._PLAINTEXT_APPROVAL_PREFIXES):
+                    _match = ("approve", "")
                 if _match is not None:
                     _verb, _normalized_args = _match
                     _approval_handler = (

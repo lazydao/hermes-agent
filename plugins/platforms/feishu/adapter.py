@@ -2184,15 +2184,18 @@ class FeishuAdapter(BasePlatformAdapter):
         future.add_done_callback(self._log_background_failure)
         return True
 
-    def _is_interactive_operator_authorized(self, open_id: str) -> bool:
-        """Return whether this card-action operator may answer gated prompts."""
+    def _is_interactive_operator_authorized(self, open_id: str, *, user_id: str = "") -> bool:
+        """Return whether this card-action operator may answer gated prompts. ``user_id`` (the
+        operator's tenant id, approval cards only) matches allowlists written with user_ids; group
+        admission rules never broaden this list."""
         normalized = str(open_id or "").strip()
         if not normalized:
             return False
         allowed_ids = set(self._admins) | set(self._allowed_group_users)
         if not allowed_ids:
             return True
-        return "*" in allowed_ids or normalized in allowed_ids
+        operator_ids = {normalized, str(user_id or "").strip()} - {""}
+        return "*" in allowed_ids or bool(operator_ids & allowed_ids)
 
     @staticmethod
     def _card_response(card_data: Optional[Dict[str, Any]] = None) -> Any:
@@ -2208,7 +2211,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return response
 
     def _validate_card_action(
-        self, *, event: Any, state: Dict[str, str], label: str, ident: Any,
+        self, *, event: Any, state: Dict[str, str], label: str, ident: Any, user_id: str = "",
     ) -> Optional[tuple[str, str, str]]:
         """Shared operator/chat checks for approval + update-prompt clicks.
 
@@ -2216,7 +2219,7 @@ class FeishuAdapter(BasePlatformAdapter):
         """
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        if not self._is_interactive_operator_authorized(open_id):
+        if not self._is_interactive_operator_authorized(open_id, user_id=user_id):
             logger.warning("[Feishu] Unauthorized %s click by %s", label, open_id or "<unknown>")
             return None
         callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
@@ -2240,12 +2243,15 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
             return self._card_response()
         choice = _APPROVAL_CHOICE_MAP.get(action_value.get("hermes_action"), "deny")
-        checked = self._validate_card_action(event=event, state=state, label="approval", ident=approval_id)
+        user_id = str(getattr(getattr(event, "operator", None), "user_id", "") or "")
+        checked = self._validate_card_action(
+            event=event, state=state, label="approval", ident=approval_id, user_id=user_id)
         if checked is None:
             return self._card_response()
         open_id, chat_id, user_name = checked
         coro = self._resolve_approval(
-            approval_id=approval_id, choice=choice, user_name=user_name, open_id=open_id, chat_id=chat_id,
+            approval_id=approval_id, choice=choice, user_name=user_name, open_id=open_id, user_id=user_id,
+            chat_id=chat_id,
         )
         if not self._submit_on_loop(loop, coro):
             return self._card_response()
@@ -2276,14 +2282,14 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _pop_validated_prompt_state(
         self, *, states: Dict[int, Dict[str, str]], ident: Any, label: str, open_id: str, chat_id: str,
-        unauthorized_fmt: str, operator_repr: str,
+        unauthorized_fmt: str, operator_repr: str, user_id: str = "",
     ) -> Optional[Dict[str, str]]:
         """Re-validate on the loop thread (state may have changed since the callback) and pop."""
         state = states.get(ident)
         if not state:
             logger.debug("[Feishu] %s %s already resolved or unknown", label, ident)
             return None
-        if not self._is_interactive_operator_authorized(open_id):
+        if not self._is_interactive_operator_authorized(open_id, user_id=user_id):
             logger.warning(unauthorized_fmt, operator_repr, ident)
             return None
         expected_chat_id = str(state.get("chat_id", "") or "")
@@ -2296,13 +2302,14 @@ class FeishuAdapter(BasePlatformAdapter):
         return state
 
     async def _resolve_approval(
-        self, approval_id: Any, choice: str, user_name: str, *, open_id: str = "", chat_id: str = "",
+        self, approval_id: Any, choice: str, user_name: str, *, open_id: str = "", user_id: str = "",
+        chat_id: str = "",
     ) -> None:
         """Pop approval state and unblock the waiting agent thread."""
         state = self._pop_validated_prompt_state(
             states=self._approval_state, ident=approval_id, label="Approval", open_id=open_id, chat_id=chat_id,
             unauthorized_fmt="[Feishu] Unauthorized approval click by %s for approval %s",
-            operator_repr=open_id or "<unknown>",
+            operator_repr=open_id or "<unknown>", user_id=user_id,
         )
         if not state:
             return

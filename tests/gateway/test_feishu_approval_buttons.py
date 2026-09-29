@@ -59,13 +59,14 @@ def _make_card_action_data(
     chat_id: str = "oc_12345",
     open_id: str = "ou_user1",
     token: str = "tok_abc",
+    user_id: str = "",
 ) -> SimpleNamespace:
     """Create a mock Feishu card action callback data object."""
     return SimpleNamespace(
         event=SimpleNamespace(
             token=token,
             context=SimpleNamespace(open_chat_id=chat_id),
-            operator=SimpleNamespace(open_id=open_id),
+            operator=SimpleNamespace(open_id=open_id, user_id=user_id),
             action=SimpleNamespace(
                 tag="button",
                 value=action_value,
@@ -233,6 +234,31 @@ class TestResolveApproval:
         mock_resolve.assert_not_called()
         assert 5 in adapter._approval_state
 
+    @pytest.mark.asyncio
+    async def test_operator_user_id_matches_allowlist(self):
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"u_owner"}
+        adapter._approval_state[6] = {"session_key": "sess-6", "message_id": "msg_006", "chat_id": "oc_12345"}
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._resolve_approval(
+                6, "once", "Owner", open_id="ou_owner_app_scoped", user_id="u_owner", chat_id="oc_12345")
+
+        mock_resolve.assert_called_once_with("sess-6", "once")
+
+    @pytest.mark.asyncio
+    async def test_group_open_rule_does_not_bypass_operator_allowlist(self):
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"ou_owner"}
+        adapter._group_rules["oc_open"] = feishu_module.FeishuGroupRule(policy="open", require_mention=True)
+        adapter._approval_state[7] = {"session_key": "sess-7", "message_id": "msg_007", "chat_id": "oc_open"}
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._resolve_approval(7, "session", "Group Member", open_id="ou_member", chat_id="oc_open")
+
+        mock_resolve.assert_not_called()
+        assert 7 in adapter._approval_state
+
 
 # ===========================================================================
 # _handle_card_action_event — non-approval card actions
@@ -351,6 +377,45 @@ class TestCardActionCallbackResponse:
         card = response.card.data
         assert "Old Name" not in card["elements"][0]["content"]
         assert "ou_expired" in card["elements"][0]["content"]
+
+    def test_approval_click_accepts_operator_user_id(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"u_owner"}
+        adapter._approval_state[8] = {"session_key": "sess-8", "message_id": "msg-8", "chat_id": "oc_12345"}
+        data = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 8}, open_id="ou_owner_app_scoped", user_id="u_owner",
+        )
+        submitted = []
+
+        def _capture(coro, _loop):
+            submitted.append(coro.cr_frame.f_locals.get("user_id"))
+            return _close_submitted_coro(coro, _loop)
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_capture):
+            response = adapter._on_card_action_trigger(data)
+
+        assert response.card is not None
+        assert submitted == ["u_owner"]  # re-validated with the same user_id on the loop thread
+
+    def test_update_prompt_click_still_requires_open_id_match(self, _patch_callback_card_types):
+        """The user_id alias is scoped to approval cards; update prompts keep open_id matching."""
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        adapter._allowed_group_users = {"u_owner"}
+        adapter._update_prompt_state[9] = {"session_key": "sess-9", "message_id": "msg-9", "chat_id": "oc_12345"}
+        data = _make_card_action_data(
+            {"hermes_update_prompt_action": "y", "update_prompt_id": 9},
+            open_id="ou_owner_app_scoped", user_id="u_owner",
+        )
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response.card is None
+        mock_submit.assert_not_called()
 
     def test_rejects_approval_click_from_unauthorized_user(self, _patch_callback_card_types):
         adapter = _make_adapter()
