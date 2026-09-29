@@ -43,6 +43,58 @@ def test_resolve_max_concurrent_sessions_values():
     assert active_sessions.resolve_max_concurrent_sessions({"max_concurrent_sessions": "many"}) is None
 
 
+def test_process_start_token_matches_linux_proc_identity():
+    stat_path = Path(f"/proc/{os.getpid()}/stat")
+    if not stat_path.exists():
+        pytest.skip("Linux /proc process identity is unavailable")
+
+    expected = stat_path.read_text(encoding="utf-8").split()[21]
+    assert active_sessions._process_start_token(os.getpid()) == expected
+
+
+def test_pid_liveness_compares_process_start_token_exactly(monkeypatch):
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr(active_sessions, "_process_start_token", lambda _pid: "200")
+
+    for lenient in (False, True):
+        assert active_sessions._pid_liveness(123, process_start_token="200", lenient=lenient) is True
+        assert active_sessions._pid_liveness(123, process_start_token="100", lenient=lenient) is False
+
+
+def test_pid_liveness_checks_legacy_start_time_when_token_is_absent(monkeypatch):
+    """Leases written before the token existed still carry an identity: a recycled
+    pid must not keep them alive just because the new field is missing."""
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr(active_sessions, "_process_start_token", lambda _pid: "200")
+    monkeypatch.setattr(active_sessions, "_process_start_time", lambda _pid: 1000.0)
+
+    assert active_sessions._pid_liveness(123, 1000.0, lenient=True) is True
+    assert active_sessions._pid_liveness(123, 999.0, lenient=True) is False
+    # A token, when present, is the identity; the legacy float is not consulted.
+    assert active_sessions._pid_liveness(123, 999.0, process_start_token="200") is True
+    # No usable identity at all (malformed token): keep a live pid's slot.
+    assert active_sessions._pid_liveness(123, None, process_start_token=200, lenient=True) is True
+
+
+def test_acquire_writes_only_the_stable_process_start_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(active_sessions, "_OWN_TOKEN", None)
+    monkeypatch.setattr(active_sessions, "_process_start_token", lambda _pid: "stable")
+
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="feishu:group:123",
+        surface="feishu",
+        config={"max_concurrent_sessions": 1},
+    )
+
+    assert message is None
+    assert lease is not None
+    entries = active_sessions._read_entries(active_sessions._state_path())
+    assert entries[0]["process_start_token"] == "stable"
+    assert "process_start_time" not in entries[0]
+    lease.release()
+
+
 
 
 
@@ -361,6 +413,8 @@ def test_strict_registry_rejects_structurally_invalid_entries(tmp_path, monkeypa
         {**base, "metadata": []},
         {**base, "process_start_time": "not-a-number"},
         {**base, "process_start_time": "nan"},
+        {**base, "process_start_token": 123},
+        {**base, "process_start_token": "bad\nvalue"},
     )
 
     for entry in invalid_entries:

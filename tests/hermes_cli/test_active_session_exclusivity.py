@@ -136,12 +136,18 @@ def test_a_dead_owner_is_pruned_and_a_successor_may_acquire():
     assert len(active_session_registry_snapshot()) == 1
 
 
-def test_a_recycled_pid_does_not_keep_a_lease_alive():
-    """Identity is (pid, process start time), not a pid.
+@pytest.mark.parametrize(
+    ("field", "foreign_start"),
+    (("process_start_token", "1"), ("process_start_time", 1.0)),
+    ids=("start-token", "legacy-start-time"),
+)
+def test_a_recycled_pid_does_not_keep_a_lease_alive(field, foreign_start):
+    """Identity is (pid, process start), not a pid.
 
     A pid alone is not identity -- the number is reused, and on a busy machine it
-    is reused quickly. An entry claiming OUR pid but a start time we never had is
-    a dead owner whose number was handed to somebody else.
+    is reused quickly. An entry claiming OUR pid but a start we never had is
+    a dead owner whose number was handed to somebody else. Legacy entries that
+    predate the start token still carry that identity as a start time.
     """
     lease, _ = acquire("S")
     assert lease is not None
@@ -150,7 +156,8 @@ def test_a_recycled_pid_does_not_keep_a_lease_alive():
 
     entries = _read_entries(_state_path())
     entries[0]["pid"] = os.getpid()
-    entries[0]["process_start_time"] = 1.0  # not when this process started
+    entries[0].pop("process_start_token", None)
+    entries[0][field] = foreign_start  # not when this process started
     _write_entries(_state_path(), entries)
 
     successor, refusal = acquire("S")
