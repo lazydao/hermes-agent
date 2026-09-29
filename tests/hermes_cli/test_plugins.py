@@ -17,6 +17,8 @@ from hermes_cli.plugins import (
     PluginManager,
     PluginManifest,
     _dispatch_pre_tool_call_hooks,
+    VALID_HOOKS,
+    get_pre_response_directive,
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,
     has_middleware,
@@ -2002,6 +2004,79 @@ class TestGetPreVerifyContinueMessage:
         assert seen["coding"] is True
         assert seen["attempt"] == 2
         assert seen["changed_paths"] == ["a.py"]
+
+
+class TestGetPreResponseDirective:
+    """`pre_response` final-response gate directives."""
+
+    def test_valid_hooks_include_pre_response(self):
+        assert "pre_response" in VALID_HOOKS
+
+    def test_continue_forwards_turn_identity(self, monkeypatch):
+        seen = {}
+
+        def capture(hook_name, **kwargs):
+            seen.update(kwargs)
+            return [{"action": "continue", "message": "persist it first", "fallback": "not persisted"}]
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+        assert get_pre_response_directive(turn_id="turn-1", platform_message_id="message-1") == {
+            "action": "continue", "message": "persist it first", "fallback": "not persisted",
+        }
+        assert seen["turn_id"] == "turn-1"
+        assert seen["platform_message_id"] == "message-1"
+
+    def test_replace_requires_nonempty_message(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "replace", "message": "   "},
+                {"action": "replace", "message": "safe response"},
+            ],
+        )
+        assert get_pre_response_directive() == {"action": "replace", "message": "safe response"}
+
+    def test_live_guard_signature_receives_its_kwargs(self):
+        """The h3-lifecycle-guard callback shape: keyword-only turn fields + ``**_``."""
+        seen = {}
+
+        def on_pre_response(*, turn_id="", attempt=0, final_response="", platform="", chat_type="", **_):
+            seen.update(turn_id=turn_id, attempt=attempt, final_response=final_response, platform=platform)
+            return {"action": "replace", "message": "cannot confirm"}
+
+        mgr = PluginManager()
+        mgr._discovered = True
+        mgr._hooks["pre_response"] = [on_pre_response]
+        with patch("hermes_cli.plugins.get_plugin_manager", return_value=mgr):
+            directive = get_pre_response_directive(
+                turn_id="t1", attempt=1, final_response="done", platform="feishu",
+            )
+        assert directive == {"action": "replace", "message": "cannot confirm"}
+        assert seen == {"turn_id": "t1", "attempt": 1, "final_response": "done", "platform": "feishu"}
+
+    def test_pre_response_runs_to_completion_past_callback_timeout(self, monkeypatch):
+        """Explicit policy: a slow guard is never abandoned (neither fail-open nor fail-closed)."""
+        import time
+
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.05)
+
+        def slow(**_kwargs):
+            time.sleep(0.3)
+            return {"action": "replace", "message": "late but honored"}
+
+        mgr = PluginManager()
+        mgr._hooks["pre_response"] = [slow]
+        assert mgr.invoke_hook("pre_response", final_response="x") == [
+            {"action": "replace", "message": "late but honored"},
+        ]
+
+    def test_raising_guard_is_skipped(self, monkeypatch):
+        def boom(**_kwargs):
+            raise RuntimeError("guard crashed")
+
+        mgr = PluginManager()
+        mgr._hooks["pre_response"] = [boom]
+        assert mgr.invoke_hook("pre_response", final_response="x") == []
 
 
 class TestThreadToolWhitelist:

@@ -22,8 +22,12 @@ from agent.served_model import result_model_fields
 
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
 # returned/live history to avoid role-alternation breaks; the assistant response is
-# real content and is not flagged. (#65919)
-_VERIFICATION_CONTINUATION_FLAGS = ("_verification_stop_synthetic", "_pre_verify_synthetic")
+# real content and is not flagged. (#65919) A pre_response continuation flags BOTH the
+# withheld answer and its nudge (the guard judged that answer undeliverable), so the
+# pair leaves together and alternation still holds.
+_VERIFICATION_CONTINUATION_FLAGS = (
+    "_verification_stop_synthetic", "_pre_verify_synthetic", "_pre_response_synthetic",
+)
 
 _SENTENCE_END = {".", "!", "?", "。", "！", "？", "`", ")"}
 
@@ -122,6 +126,7 @@ def _guarded_cleanup(label: str, fn: Callable[[], Any], errors: List[str], logge
 def _resolve_budget_fallback(
     agent, *, final_response, api_call_count, interrupted, failed, messages, _turn_exit_reason,
     _pending_verification_response, _pending_verification_response_previewed, logger,
+    _pending_pre_response_fallback=None,
 ) -> Tuple[Any, Any, bool]:
     """Iteration-budget exhaustion. Returns ``(final_response, _turn_exit_reason,
     preserved_verification_fallback)``."""
@@ -134,7 +139,12 @@ def _resolve_budget_fallback(
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
     ):
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
-        if _pending_verification_response:
+        if _pending_pre_response_fallback:
+            # A pre_response guard withheld the answer, then the budget ran out: deliver its
+            # user-safe fallback and never resurrect the answer that failed the gate.
+            final_response = _pending_pre_response_fallback
+            preserved_verification_fallback = True
+        elif _pending_verification_response:
             # A verification gate withheld a composed answer, then the budget ran out:
             # preserve it rather than make another fallible call. The explicit pending
             # value is the provenance guard; unrelated error exits never enter here.
@@ -491,7 +501,7 @@ def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
     _turn_exit_reason, _pending_verification_response=None,
-    _pending_verification_response_previewed=False,
+    _pending_verification_response_previewed=False, _pending_pre_response_fallback=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
@@ -502,7 +512,7 @@ def finalize_turn(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
-        logger=logger,
+        logger=logger, _pending_pre_response_fallback=_pending_pre_response_fallback,
     )
 
     # Loop exits that are failures in their own right (outer-loop error cap, shutdown, context

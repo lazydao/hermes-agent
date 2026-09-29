@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 
 from agent.message_metadata import append_message
 from agent.turn_empty_response import recover_empty_response
-from agent.turn_stop_gates import apply_stop_gates
+from agent.turn_stop_gates import apply_pre_response_gate, apply_stop_gates
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -40,6 +40,7 @@ class FinalResponseVerdict:
     length_continue_retries: Any
     _pending_verification_response: Any
     _pending_verification_response_previewed: Any
+    _pending_pre_response_fallback: Any
     result: Optional[Dict[str, Any]] = None
 
 
@@ -50,6 +51,7 @@ def finish_text_response(
     _preflight_compression_blocked: Any, codex_ack_continuations: Any,
     truncated_response_parts: Any, length_continue_retries: Any,
     _pending_verification_response: Any, _pending_verification_response_previewed: Any,
+    original_user_message: Any = None, _pending_pre_response_fallback: Any = None,
 ) -> FinalResponseVerdict:
     """Finish (or defer) a text-only assistant response in the original guard order. Every
     continuation path sets ``final_response = None`` so an acknowledgment never suppresses
@@ -70,6 +72,7 @@ def finish_text_response(
             length_continue_retries=length_continue_retries,
             _pending_verification_response=_pending_verification_response,
             _pending_verification_response_previewed=_pending_verification_response_previewed,
+            _pending_pre_response_fallback=_pending_pre_response_fallback,
             result=result,
         )
 
@@ -299,6 +302,18 @@ def finish_text_response(
     _pending_verification_response_previewed = _sg.pending_verification_response_previewed
     if _sg.continue_turn:
         final_response = None
+        return _verdict("continue")
+
+    # Final-response policy gate: runs on any accepted answer, before the output transform
+    # and the durable append (a withheld answer never becomes transcript).
+    _rg = apply_pre_response_gate(
+        agent, final_msg, final_response=final_response, messages=messages,
+        user_message=original_user_message if original_user_message is not None else user_message,
+        pending_pre_response_fallback=_pending_pre_response_fallback,
+    )
+    _pending_pre_response_fallback = _rg.pending_pre_response_fallback
+    final_response = _rg.final_response
+    if _rg.continue_turn:
         return _verdict("continue")
 
     # Plugins rewrite the reply BEFORE it is appended and flushed: SQLite treats a non-blank

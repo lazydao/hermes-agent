@@ -101,3 +101,27 @@ def test_db_flush_drops_only_nudge_keeps_candidate(tmp_path, monkeypatch):
     assert "premature done" in persisted
     # Only the nudge is dropped.
     assert "[System: run tests]" not in persisted
+
+
+def test_db_flush_drops_pre_response_withheld_pair(tmp_path, monkeypatch):
+    """A pre_response continuation flags BOTH the withheld answer and its nudge: the guard
+    judged that answer undeliverable, so neither row may become durable transcript."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    ra = _fresh_run_agent(tmp_path)
+    agent = _make_agent(ra, "sess_pre_response", tmp_path)
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "unsafe claim", "_pre_response_synthetic": True},
+        {"role": "user", "content": "[guard nudge]", "_pre_response_synthetic": True},
+        {"role": "assistant", "content": "checked answer"},
+    ]
+
+    agent._flush_messages_to_session_db(messages, conversation_history=[])
+
+    persisted = [
+        msg.get("content")
+        for _args, kwargs in agent._session_db.append_messages_batch.call_args_list
+        for msg in kwargs["messages"]
+    ]
+    assert persisted == ["hi", "checked answer"]

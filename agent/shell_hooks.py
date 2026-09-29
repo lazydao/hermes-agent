@@ -466,12 +466,27 @@ def _parse_pre_verify(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _parse_pre_response(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # {"action": "continue"|"replace", "message", "fallback"?}; no message is a no-op.
+    action = str(data.get("action") or "").strip().lower()
+    message = data.get("message")
+    if action not in {"continue", "replace"} or not isinstance(message, str) or not message.strip():
+        return None
+    result = {"action": action, "message": message.strip()}
+    fallback = data.get("fallback")
+    if isinstance(fallback, str) and fallback.strip():
+        result["fallback"] = fallback.strip()
+    return result
+
+
 def _parse_context(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     context = data.get("context")
     return {"context": context} if isinstance(context, str) and context.strip() else None
 
 
-_RESPONSE_PARSERS: Dict[str, Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = {"pre_tool_call": _parse_pre_tool_call, "pre_verify": _parse_pre_verify}
+_RESPONSE_PARSERS: Dict[str, Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = {
+    "pre_tool_call": _parse_pre_tool_call, "pre_verify": _parse_pre_verify, "pre_response": _parse_pre_response,
+}
 
 
 def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:

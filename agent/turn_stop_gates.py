@@ -5,8 +5,9 @@ interim row plus a synthetic user-role nudge and continue the turn: verify-on-st
 the ``pre_verify`` plugin hook after code edits, and the kanban worker terminal-tool guard.
 Each keeps the candidate answer as a budget-exhaustion fallback
 (``pending_verification_response``) and clears ``final_response`` so the finalizer can tell
-this gate from error exits (#61631). Nothing here imports ``agent.conversation_loop`` at
-module level (cycle).
+this gate from error exits (#61631). The ``pre_response`` policy gate runs after them on any
+accepted answer (see :func:`apply_pre_response_gate`). Nothing here imports
+``agent.conversation_loop`` at module level (cycle).
 """
 
 from __future__ import annotations
@@ -173,3 +174,76 @@ def apply_stop_gates(
         pending_verification_response=pending_verification_response,
         pending_verification_response_previewed=pending_verification_response_previewed,
     )
+
+
+@dataclass
+class PreResponseVerdict:
+    """``continue_turn`` True → the withheld answer and a nudge were appended; re-enter the loop
+    with ``final_response=None``. Otherwise ``final_response`` is the (possibly replaced) answer."""
+
+    continue_turn: bool
+    final_response: Any
+    pending_pre_response_fallback: Any
+
+
+_DEFAULT_PRE_RESPONSE_FALLBACK = (
+    "I could not complete the required response checks, so I have not confirmed completion."
+)
+
+
+def apply_pre_response_gate(
+    agent: Any, final_msg: Dict[str, Any], *, final_response: Any, messages: List[Dict[str, Any]],
+    user_message: Any, pending_pre_response_fallback: Any,
+) -> PreResponseVerdict:
+    """Final-response policy gate (``pre_response`` hook), run on any answer the stop gates
+    accepted. ``continue`` withholds the answer for at most ``agent.max_pre_response_nudges``
+    more iterations: the answer and the nudge are appended as ONE alternating assistant+user
+    pair, both flagged ``_pre_response_synthetic`` (never persisted, never emitted, stripped at
+    finalize). ``replace`` — or a ``continue`` past the bound, which delivers the hook's safe
+    ``fallback`` — rewrites the answer in place. A failing hook check lets the answer through."""
+    attempt = getattr(agent, "_pre_response_nudges", 0)
+    directive = None
+    max_nudges = 0
+    try:
+        from agent.response_hooks import max_pre_response_nudges
+        from hermes_cli.lifecycle import has_hook
+        from hermes_cli.plugins import get_pre_response_directive
+
+        if has_hook("pre_response"):
+            directive = get_pre_response_directive(
+                session_id=getattr(agent, "session_id", None) or "",
+                task_id=getattr(agent, "_current_task_id", "") or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                platform=getattr(agent, "platform", "") or "",
+                model=getattr(agent, "model", "") or "",
+                attempt=attempt, user_message=user_message,
+                platform_message_id=getattr(agent, "_persist_user_message_platform_id", None) or "",
+                final_response=final_response,
+            )
+            max_nudges = max_pre_response_nudges()
+    except Exception:
+        logger.debug("pre_response hook check failed", exc_info=True)
+        directive = None
+    if not directive:
+        return PreResponseVerdict(False, final_response, pending_pre_response_fallback)
+
+    action, message = directive["action"], directive["message"]
+    fallback = directive.get("fallback") or _DEFAULT_PRE_RESPONSE_FALLBACK
+    if action == "continue" and attempt < max_nudges:
+        agent._pre_response_nudges = attempt + 1
+        final_msg["finish_reason"] = "response_hook_continue"
+        final_msg["_pre_response_synthetic"] = True
+        append_message(messages, final_msg)
+        append_message(messages, {"role": "user", "content": message, "_pre_response_synthetic": True})
+        agent._session_messages = messages
+        logger.debug("pre_response nudge issued (attempt %d)", agent._pre_response_nudges)
+        return PreResponseVerdict(True, None, fallback)
+    if action == "continue":
+        # Continuation bound reached: deliver the hook's safe fallback, never the answer that
+        # failed the gate.
+        message = fallback
+    final_msg["content"] = message
+    # A promoted-reasoning sidecar would replay the withheld text on the wire.
+    final_msg.pop("api_content", None)
+    final_msg["finish_reason"] = "response_hook_replace"
+    return PreResponseVerdict(False, message, pending_pre_response_fallback)

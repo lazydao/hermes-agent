@@ -1354,6 +1354,9 @@ class _LoopState:
     # is set ONLY if it becomes the final response (#65919).
     _pending_verification_response: Any = None
     _pending_verification_response_previewed: bool = False
+    # User-safe fallback from a pre_response ``continue`` directive. Unlike the verification
+    # candidate it replaces (never resurrects) the withheld answer if the budget runs out.
+    _pending_pre_response_fallback: Any = None
     # MoA guidance retained across a pre-API compression, rebased next iteration (no second fan-out).
     pending_moa_prepared_request: Any = None
     # Per-iteration slots.

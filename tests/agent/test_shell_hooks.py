@@ -57,6 +57,16 @@ class TestParseResponse:
         approval prompt (#92553). It now yields the same shape Python plugins return."""
         assert shell_hooks._parse_response("pre_tool_call", stdout) == expected
 
+    @pytest.mark.parametrize("stdout, expected", [
+        ('{"action": "continue", "message": " persist first ", "fallback": " not persisted "}',
+         {"action": "continue", "message": "persist first", "fallback": "not persisted"}),
+        ('{"action": "replace", "message": "safe text"}', {"action": "replace", "message": "safe text"}),
+        ('{"action": "replace", "message": "  "}', None),
+        ('{"context": "not a gate directive"}', None),
+    ])
+    def test_pre_response_directives(self, stdout, expected):
+        assert shell_hooks._parse_response("pre_response", stdout) == expected
+
     def test_empty_stdout_returns_none(self):
         assert shell_hooks._parse_response("pre_tool_call", "") is None
         assert shell_hooks._parse_response("pre_tool_call", "   ") is None

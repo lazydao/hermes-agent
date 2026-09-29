@@ -115,7 +115,13 @@ VALID_HOOKS: Set[str] = {
     # pre_verify: once per turn when the agent edited code and is about to verify/finish. Return
     # {"action": "continue", "message"} (or Claude-Code Stop {"decision": "block", "reason"}) to keep
     # going; anything else finishes. Bounded by agent.max_verify_nudges.
-    "pre_verify", "pre_api_request", "post_api_request", "api_request_error",
+    "pre_verify",
+    # pre_response: after the model composes a text response (and the stop gates accept it), before
+    # it is committed or returned. {"action": "continue", "message", "fallback"} withholds it for a
+    # bounded follow-up (agent.max_pre_response_nudges); {"action": "replace", "message"} delivers
+    # the message instead. Anything else lets the response through.
+    "pre_response",
+    "pre_api_request", "post_api_request", "api_request_error",
     # pre/post_auxiliary_call: once per physical provider attempt of an auxiliary LLM call
     # (agent/auxiliary_hooks.py — titling, compression, MoA, vision, approval, ...). Same payload
     # shape as pre/post_api_request plus ``aux_task``; distinct events so turn-scoped
@@ -1992,6 +1998,33 @@ def get_pre_verify_continue_message(
         message = result.get("message") or result.get("reason")
         if action in ("continue", "block") and isinstance(message, str) and message.strip():
             return message.strip()
+    return None
+
+
+def get_pre_response_directive(
+    *, session_id: str = "", task_id: str = "", turn_id: str = "", platform: str = "", model: str = "",
+    attempt: int = 0, user_message: Any = "", platform_message_id: str = "", final_response: str = "",
+) -> Optional[Dict[str, str]]:
+    """First actionable ``pre_response`` directive, or ``None``. ``continue`` withholds the composed
+    response for another model iteration (an optional user-safe ``fallback`` is delivered if the
+    budget runs out first); ``replace`` delivers ``message`` instead of the response."""
+    hook_results = invoke_hook(
+        "pre_response", session_id=session_id, task_id=task_id, turn_id=turn_id, platform=platform,
+        model=model, attempt=attempt, user_message=user_message,
+        platform_message_id=platform_message_id, final_response=final_response,
+    )
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        action = str(result.get("action") or "").strip().lower()
+        message = result.get("message")
+        if action not in {"continue", "replace"} or not isinstance(message, str) or not message.strip():
+            continue
+        directive = {"action": action, "message": message.strip()}
+        fallback = result.get("fallback")
+        if isinstance(fallback, str) and fallback.strip():
+            directive["fallback"] = fallback.strip()
+        return directive
     return None
 
 
