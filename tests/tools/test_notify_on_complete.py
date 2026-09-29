@@ -60,6 +60,38 @@ def _make_session(
 
 class TestCompletionQueue:
 
+    def test_completion_carries_originating_request_budget(self, registry):
+        from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY, IterationBudget
+
+        budget = IterationBudget(90)
+        s = _make_session(notify_on_complete=True, output="done", exit_code=0)
+        s.request_chain_budget = budget
+        s.exited = True
+        registry._running[s.id] = s
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(s)
+
+        assert registry.completion_queue.get_nowait()[REQUEST_CHAIN_BUDGET_EVENT_KEY] is budget
+
+    def test_spawn_captures_the_root_agent_request_budget(self, registry):
+        """A process started inside a turn (even by a delegated child) belongs to the ROOT
+        request: the child's own delegation budget must never cap the parent's completion turn."""
+        import weakref
+        from agent.iteration_budget import IterationBudget
+        from agent.subagent_lifecycle import bind_subagent_parent
+
+        class _Agent:
+            def __init__(self, depth, budget, parent=None):
+                self._delegate_depth, self.iteration_budget = depth, budget
+                self._delegate_parent_ref = weakref.ref(parent) if parent else None
+
+        root = _Agent(0, IterationBudget(90))
+        child = _Agent(1, IterationBudget(50), root)
+        with bind_subagent_parent(child):
+            session = registry._new_session("echo hi", "t1", "", "", "/tmp")
+        assert session.request_chain_budget is root.iteration_budget
+        assert registry._new_session("echo hi", "t1", "", "", "/tmp").request_chain_budget is None
+
 
     def test_move_to_finished_idempotent_no_duplicate(self, registry):
         """Calling _move_to_finished twice must NOT enqueue two notifications.

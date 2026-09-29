@@ -171,6 +171,34 @@ def _build(agent, **overrides):
     return build_turn_context(**kwargs)
 
 
+def test_ordinary_turn_gets_a_fresh_iteration_budget():
+    from agent.iteration_budget import IterationBudget
+
+    agent = _FakeAgent()
+    stale = IterationBudget(90)
+    assert stale.consume()
+    agent.iteration_budget = stale
+
+    _build(agent)
+
+    assert agent.iteration_budget is not stale
+    assert (agent.iteration_budget.max_total, agent.iteration_budget.used) == (90, 0)
+
+
+def test_internal_continuation_adopts_the_request_chain_budget():
+    from agent.iteration_budget import IterationBudget
+
+    agent = _FakeAgent()
+    request_budget = IterationBudget(90)
+    for _ in range(3):
+        assert request_budget.consume()
+
+    _build(agent, iteration_budget=request_budget)
+
+    assert agent.iteration_budget is request_budget
+    assert agent.iteration_budget.used == 3
+
+
 def test_returns_turn_context_with_user_message_appended():
     agent = _FakeAgent()
     ctx = _build(agent)

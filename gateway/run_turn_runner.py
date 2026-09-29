@@ -989,6 +989,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
+            if ctx.request_chain_budget is not None and _accepts_keyword(agent.run_conversation, "iteration_budget"):
+                kwargs["iteration_budget"] = ctx.request_chain_budget
             from agent.notification_presentation import notification_turn
             from gateway.session_results import execution_result
             captured = execution_result.get()
@@ -1236,6 +1238,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         if room is not None:
             max_iterations = room.max_iterations
             ctx.enabled_toolsets = list(room.enabled_toolsets)
+        if ctx.request_chain_budget is None:
+            # A user turn opens a request chain; its internal continuations reuse this budget.
+            from agent.iteration_budget import IterationBudget
+            ctx.request_chain_budget = IterationBudget(max_iterations)
         try:
             model, runtime_kwargs = runner._resolve_session_agent_runtime(
                 source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,

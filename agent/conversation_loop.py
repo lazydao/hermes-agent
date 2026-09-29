@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from agent.agent_runtime_helpers_placeholders import hidden_interrupt_placeholder_row
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
+from agent.iteration_budget import IterationBudget
 from agent.message_metadata import append_message, without_persistence_fields
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
@@ -1639,6 +1640,7 @@ def _run_conversation_turn(
     moa_config: Optional[dict[str, Any]] = None,
     title_user_message: Optional[str] = None,
     prelude: Optional[Prelude] = None,
+    iteration_budget: Optional[IterationBudget] = None,
 ) -> dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
 
@@ -1676,7 +1678,7 @@ def _run_conversation_turn(
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
             persist_user_platform_id=persist_user_platform_id,
-            turn_author=turn_author,
+            turn_author=turn_author, iteration_budget=iteration_budget,
             restore_or_build_system_prompt=_restore_or_build_system_prompt,
             install_safe_stdio=_install_safe_stdio,
             sanitize_surrogates=_sanitize_surrogates,
@@ -1801,8 +1803,12 @@ def run_conversation(
     turn_author: Optional[dict[str, Any]] = None,
     title_user_message: Optional[str] = None,
     prelude: Optional[Prelude] = None,
+    iteration_budget: Optional[IterationBudget] = None,
 ) -> dict[str, Any]:
     """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
+
+    ``iteration_budget``: the gateway's request-chain budget for this turn (shared by the internal
+    continuations of one user request); omitted → a fresh per-turn budget.
 
     Every envelope that leaves the loop — success, partial/error, interrupt, retry-exhausted,
     tool-limit, preflight timeout, codex runtime — passes through here, so the
@@ -1835,6 +1841,7 @@ def run_conversation(
                 turn_author=turn_author,
                 title_user_message=title_user_message,
                 prelude=prelude,
+                iteration_budget=iteration_budget,
             )
         finally:
             end_voice_turn_route(agent)

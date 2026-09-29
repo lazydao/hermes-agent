@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional, cast
 
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
+from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY, IterationBudget
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
@@ -924,6 +925,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if getattr(source, "message_id", None):
                 from gateway.session_identity import replace_source
                 source = replace_source(source, message_id=None)
+            # The continuation turn shares the originating request's iteration budget.
+            if isinstance(evt.get(REQUEST_CHAIN_BUDGET_EVENT_KEY), IterationBudget):
+                metadata[REQUEST_CHAIN_BUDGET_EVENT_KEY] = evt[REQUEST_CHAIN_BUDGET_EVENT_KEY]
             synth_event = MessageEvent(
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 metadata=metadata,
@@ -1720,6 +1724,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             "parent_session_id": (
                 watcher.get("parent_session_id") or getattr(session, "parent_session_id", "") or ""
             ),
+            # Process-local: the completion turn continues the request that started the process.
+            REQUEST_CHAIN_BUDGET_EVENT_KEY: getattr(session, "request_chain_budget", None),
         }
 
     def _format_process_final_message(self, session_id: str, session, notify_mode: str) -> str:

@@ -30,6 +30,7 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
 
+from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY
 from hermes_cli.config import get_hermes_home
 
 from tools.process_registry_notifications import (
@@ -570,6 +571,9 @@ class ProcessSession:
     persist_on_release: bool = False           # opt out of agent-lifecycle cleanup (release()/turn-abandon kill
                                                 # sweeps), per terminal(background=true, persist_on_release=true) (#41225)
     output_log: str = ""                        # file the process writes to (worker spawns; no pipe to lose)
+    # IterationBudget of the request that spawned this process; its notify/watch turns continue that
+    # request. Process-local: never checkpointed (holds a lock; a restarted gateway starts fresh).
+    request_chain_budget: Any = field(default=None, repr=False)
     # Watcher/notification routing (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -895,6 +899,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             "owner_task_id": session.owner_task_id,
             "command": session.command,
             **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
+            REQUEST_CHAIN_BUDGET_EVENT_KEY: session.request_chain_budget,
         }
 
     @staticmethod
@@ -1084,6 +1089,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     @staticmethod
     def _new_session(command, task_id, owner_task_id, session_key, cwd, **extra) -> ProcessSession:
+        from agent.iteration_budget import current_request_chain_budget
         from gateway.session_context import get_session_env
 
         return ProcessSession(
@@ -1091,7 +1097,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             owner_task_id=owner_task_id, session_key=session_key, cwd=cwd,
             parent_session_id=get_session_env("HERMES_SESSION_ID", ""),
             wsl_chain=_is_wsl_launcher_command(command),
-            started_at=time.time(), **extra)
+            started_at=time.time(), request_chain_budget=current_request_chain_budget(), **extra)
 
     @staticmethod
     def _env_temp_dir(env: Any) -> str:
@@ -1603,6 +1609,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 # Stable producer identity across checkpoint recovery (unlike a
                 # consumer-observed completion timestamp).
                 "started_at": session.started_at,
+                REQUEST_CHAIN_BUDGET_EVENT_KEY: session.request_chain_budget,
             }
             _redact_process_result(notification)
             self.completion_queue.put(notification)

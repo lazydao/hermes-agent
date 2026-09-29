@@ -264,6 +264,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            from gateway.run import _request_chain_budget_from_event
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -280,6 +281,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                request_chain_budget=_request_chain_budget_from_event(event),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -1848,7 +1850,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
         from gateway.platforms.base import merge_pending_message_event
-        from gateway.run import _preserve_queued_followup_history_offset
+        from gateway.run import _preserve_queued_followup_history_offset, _request_chain_budget_for_followup
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
         )
@@ -1967,6 +1969,11 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         from gateway.run_turn_followup_ack import _followup_cancel_outcome, _run_followup_processing_hook
         _hook_adapter = self._intake_adapter_for(next_source) if pending_event is not None else None
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
+        # Internal continuations / a leftover /steer stay on this request's iteration budget.
+        _leftover_steer = pending_event is None and bool(pending) and pending == result.get("pending_steer")
+        next_request_chain_budget = _request_chain_budget_for_followup(
+            getattr(turn_ctx, "request_chain_budget", None), pending_event, leftover_steer=_leftover_steer,
+        )
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
@@ -1984,6 +1991,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 persist_user_display_metadata={
                     **display_metadata_for_event(pending_event),
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                request_chain_budget=next_request_chain_budget,
             )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -2312,6 +2320,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        request_chain_budget: Any = None,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -2358,6 +2367,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
+            request_chain_budget=request_chain_budget,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
