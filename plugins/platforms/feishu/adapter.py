@@ -3399,6 +3399,17 @@ class FeishuAdapter(BasePlatformAdapter):
             return rule.require_mention
         return self._require_mention
 
+    def group_rule_authorizes(self, chat_id: Optional[str], user_id: Optional[str],
+                              user_id_alt: Optional[str] = None) -> bool:
+        """Gateway grant for an exact ``group_rules.<chat_id>`` entry: the named chat is an explicit
+        allowlist, so ``policy: open`` admits everyone there without DM or other-group access. The rule
+        is re-judged for this sender because reaction and card-action events skip ``_admit``; a chat
+        without an exact rule, or with ``disabled``/unknown policy, never grants."""
+        rule = self._group_rules.get(str(chat_id)) if chat_id else None
+        if rule is None or rule.policy not in {"open", "allowlist", "blacklist", "admin_only"}:
+            return False
+        return self._allow_group_message(SimpleNamespace(open_id=user_id, user_id=user_id_alt), str(chat_id))
+
     def _allow_group_message(self, sender_id: Any, chat_id: str = "", *, is_bot: bool = False) -> bool:
         """Per-group policy gate for non-DM traffic."""
         sender_ids = {getattr(sender_id, "open_id", None), getattr(sender_id, "user_id", None)} - {None}

@@ -551,6 +551,15 @@ class GatewayAuthorizationMixin:
                 adapter_group_allowed = self._adapter_extra_for_source(source).get("group_allowed_chats")
                 if adapter_group_allowed and _allows(_coerce_allow_set(adapter_group_allowed), source.chat_id):
                     return True
+            # An exact per-chat access rule (Feishu ``group_rules.<chat_id>``) is itself an explicit chat
+            # allowlist: ``policy: open`` admits that named chat only, never DMs or other groups, and a
+            # default/top-level open group policy is not enough. The serving profile's adapter judges
+            # its own rule for this sender (reaction/card events skip its intake gate).
+            with contextlib.suppress(Exception):
+                adapter = self._authorization_adapter(source.platform, adapter_profile)
+                rule_check = getattr(adapter, "group_rule_authorizes", None) if adapter is not None else None
+                if callable(rule_check) and rule_check(source.chat_id, source.user_id, source.user_id_alt) is True:
+                    return True
         # Bots admitted by {PLATFORM}_ALLOW_BOTS (scoped env → the routed adapter's YAML ``allow_bots`` →
         # none) bypass the human allowlist (Slack Workflow Builder posts arrive with user=None). The YAML
         # rung is what a secondary profile has: its config is never bridged into the process env.
