@@ -401,7 +401,7 @@ class GatewayInboundMixin:
             _clarify_adapter = self._delivery_adapter_for(source)
             if _clarify_adapter:
                 try:
-                    _clarify_adapter.resume_typing_for_chat(source.chat_id)
+                    await _clarify_adapter.note_clarify_answer_accepted(_quick_key, event)
                 except Exception:
                     logger.debug("Failed to resume typing after clarify response", exc_info=True)
                 # A typed answer to a native card (numeric pick, or text after "Other") never

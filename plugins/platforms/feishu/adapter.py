@@ -2519,6 +2519,8 @@ class FeishuAdapter(BasePlatformAdapter):
         data = await self._reaction_call("Remove", message_id, reaction_id, _build, self._client.im.v1.message_reaction.delete)
         return data is not None
 
+    link_clarify_reactions = True
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         message_id = event.message_id
         if not self._reactions_enabled() or not message_id or message_id in self._pending_processing_reactions:
