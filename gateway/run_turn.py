@@ -1761,6 +1761,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
 
     async def _run_agent_deliver_first_response(
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
+        pending_event: Any = None,
     ) -> None:
         """Deliver the first response before a queued follow-up runs, unless streaming already did."""
         if turn_ctx.mute_notification_reply:
@@ -1795,6 +1796,13 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 _already_streamed = False
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
+        from gateway.run import _should_defer_internal_iteration_limit_response
+        if first_response and _should_defer_internal_iteration_limit_response(_delivery_result, pending_event):
+            logger.info(
+                "Queued internal follow-up for session %s: deferring the iteration-limit response "
+                "until the continuation completes.", session_key or "?",
+            )
+            first_response = ""
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -1870,7 +1878,9 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
 
         # Interrupted: discard the response ("Operation interrupted." is noise).
         if not result.get("interrupted"):
-            await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
+            await self._run_agent_deliver_first_response(
+                turn_ctx, adapter, response, result, stream_task, pending_event=pending_event,
+            )
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
