@@ -1362,6 +1362,8 @@ credential_pool_sharing:
   openai-codex: global
 ```
 
+Under `fill_first`, `credential_pool_preferred.<provider>: <entry id>` makes one profile try that credential first without changing the pool's stored priority order (see [Prefer an account in one profile](./features/credential-pools.md#prefer-an-account-in-one-profile)).
+
 ## Prompt caching
 
 Hermes turns on cross-session prompt caching automatically when the active provider supports it — no user config needed.

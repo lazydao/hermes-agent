@@ -995,6 +995,11 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # providers only); set by load_pool(), consumed by add_entry().
         self._borrowed_root_ids: Set[str] = set()
         self._strategy = get_pool_strategy(provider)
+        config = _load_config_safe() or {}
+        preferences = config.get("credential_pool_preferred")
+        preferred = preferences.get(provider) if isinstance(preferences, dict) else None
+        # This profile's preferred entry id under fill_first; never persisted as priority.
+        self._preferred_id = preferred.strip() if isinstance(preferred, str) else ""
         # RLock: _replace_entry/_persist self-acquire it so the DEFERRED
         # single-use-token refresh path (network I/O outside the lock by
         # design) still serializes its pool mutations; in-lock callers
@@ -2157,6 +2162,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
             self._persist(removed_ids=entries_to_prune)
+        # Reorder only this selection view, never the shared persisted priority.
+        if self._strategy == STRATEGY_FILL_FIRST and self._preferred_id:
+            available.sort(key=lambda entry: entry.id != self._preferred_id)
         return available, pending_refresh
 
     def _log_no_available_entries(self) -> None:
@@ -2430,9 +2438,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 return None, pending_refresh
 
             below_cap = [e for e in available if self._active_leases.get(e.id, 0) < self._max_concurrent]
+            prefer = self._strategy == STRATEGY_FILL_FIRST and bool(self._preferred_id)
             chosen = min(
                 below_cap or available,
-                key=lambda entry: (self._active_leases.get(entry.id, 0), entry.priority),
+                key=lambda entry: (
+                    prefer and entry.id != self._preferred_id,
+                    self._active_leases.get(entry.id, 0),
+                    entry.priority,
+                ),
             )
             self._active_leases[chosen.id] = self._active_leases.get(chosen.id, 0) + 1
             self._current_id = chosen.id
