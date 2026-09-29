@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -832,8 +833,11 @@ def _profile_owns_pool_provider(provider: str) -> bool:
     """True when the ACTIVE auth.json has its own rows for *provider*.
 
     Named profiles with no local rows read the provider through the
-    ``read_credential_pool`` global-root fallback ("borrowing").
+    ``read_credential_pool`` global-root fallback ("borrowing"). A provider
+    opted into the global pool never does: its local rows are ignored.
     """
+    if auth_mod.shared_credential_pool_path(provider) is not None:
+        return False
     try:
         pool = _load_auth_store().get("credential_pool")
     except Exception:
@@ -911,8 +915,11 @@ def persist_pool_entries(
     pair only to its own file, and root plus every sibling die with
     ``invalid_grant`` (#100339). Such rows are written back to the root store
     (under the root lock); everything else goes to the active store.
+    A provider opted into the global pool is root-owned outright, so
+    ``write_credential_pool`` writes (and adds/removes) its rows in root.
     """
-    if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS and not _profile_owns_pool_provider(provider):
+    shared = auth_mod.shared_credential_pool_path(provider) is not None
+    if not shared and provider in SINGLE_USE_REFRESH_POOL_PROVIDERS and not _profile_owns_pool_provider(provider):
         global_path = _borrowed_single_use_pool_root()
         if global_path is not None:
             try:
@@ -1143,6 +1150,68 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             if self._current_id == entry.id:
                 self._current_id = None
             self._persist(removed_ids=removed_ids)
+
+    # ---- opt-in global pool (credential_pool_sharing) ----------------------
+
+    @contextmanager
+    def _locked_for_mutation(self):
+        """``self._lock``; for an opted-in global pool also the shared store lock and a reload.
+
+        The store lock is taken FIRST — the order the deferred refresh path uses (store lock, then
+        the self-locking primitives) — and the root rows are re-read under it, so every profile
+        selects, rotates and edits against the latest shared order, cooldowns and tokens.
+        """
+        if not auth_mod.credential_pool_is_globally_shared(self.provider):
+            with self._lock:
+                yield
+            return
+        with auth_mod.credential_pool_store_lock(self.provider):
+            with self._lock:
+                self._reload_shared_entries()
+                yield
+
+    def _reload_shared_entries(self) -> None:
+        """Replace the in-memory rows with the shared root rows (caller holds both locks).
+
+        Borrowed sources persist without their secret, so keep the secret this
+        process hydrated at load time and adopt everything else from disk.
+        """
+        live = {entry.id: entry for entry in self._entries}
+        entries: List[PooledCredential] = []
+        for payload in read_credential_pool(self.provider):
+            if not isinstance(payload, dict):
+                continue
+            current = live.get(payload.get("id"))
+            if current is not None and is_borrowed_credential_source(payload.get("source"), self.provider):
+                hydrated = {
+                    f.name: getattr(current, f.name) for f in fields(current) if f.name not in ("provider", "extra")
+                }
+                payload = {**current.extra, **hydrated, **payload}
+            entries.append(PooledCredential.from_dict(self.provider, payload))
+        self._entries = sorted(entries, key=lambda entry: entry.priority)
+        valid_ids = {entry.id for entry in self._entries}
+        if self._current_id not in valid_ids:
+            self._current_id = None
+        self._active_leases = {cid: count for cid, count in self._active_leases.items() if cid in valid_ids}
+
+    def _sync_shared_entry_from_store(self, entry: PooledCredential) -> PooledCredential:
+        """Adopt a token pair another profile rotated into the shared root row for *entry*."""
+        if not auth_mod.credential_pool_is_globally_shared(self.provider):
+            return entry
+        if is_borrowed_credential_source(entry.source, self.provider):
+            return entry
+        persisted = next(
+            (p for p in read_credential_pool(self.provider) if isinstance(p, dict) and p.get("id") == entry.id),
+            None,
+        )
+        if persisted is None:
+            return entry
+        stored = PooledCredential.from_dict(self.provider, persisted)
+        if stored.access_token == entry.access_token and stored.refresh_token == entry.refresh_token:
+            return entry
+        logger.debug("Pool entry %s: adopting tokens rotated in the shared credential pool", entry.id)
+        self._replace_entry(entry, stored)
+        return stored
 
     # ---- exhaustion --------------------------------------------------------
 
@@ -1485,10 +1554,17 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # ``invalid_grant`` (for Anthropic sources other than claude_code
         # there was no recovery path at all). Serialize through the shared
         # cross-process auth-store flock; a waiter's in-lock re-sync picks up
-        # the winner's rotated token and skips the POST.
-        with _auth_store_lock(timeout_seconds=self._single_use_refresh_lock_timeout()):
+        # the winner's rotated token and skips the POST. An opted-in global
+        # pool serializes on the ROOT store's lock as well, across profiles.
+        lock_timeout = self._single_use_refresh_lock_timeout()
+        store_lock = (
+            auth_mod.credential_pool_store_lock(self.provider, lock_timeout)
+            if auth_mod.credential_pool_is_globally_shared(self.provider)
+            else _auth_store_lock(timeout_seconds=lock_timeout)
+        )
+        with store_lock:
             if self.provider == "openai-codex":
-                synced = self._sync_entry_from_auth_store(entry)
+                synced = self._sync_entry_from_auth_store(self._sync_shared_entry_from_store(entry))
                 if synced is not entry and not force and not self._entry_needs_refresh(synced):
                     return synced
                 return self._refresh_entry_impl(synced, force=force)
@@ -1712,6 +1788,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         pre-POST sync and the HTTP call; re-read the provider's token
         authority once more and adopt fresher tokens before giving up.
         """
+        synced = self._sync_shared_entry_from_store(entry)
+        if synced.refresh_token != entry.refresh_token:
+            logger.debug("%s refresh failed but the shared pool has newer tokens — adopting", self.provider)
+            return self._adopt(synced, **_MARK_OK)
         if self.provider == "anthropic":
             if entry.source == "claude_code":
                 synced = self._sync_anthropic_entry_from_credentials_file(entry)
@@ -1950,7 +2030,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         return entry
 
     def _select_under_lock(self, *, model: Optional[str] = None) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
-        with self._lock:
+        with self._locked_for_mutation():
             return self._select_unlocked(model=model)
 
     def _refresh_pending_entries(self, pending: List[PooledCredential]) -> None:
@@ -2228,7 +2308,27 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         failure_reason: Optional[str] = None,
         model: Optional[str] = None,
     ) -> Optional[PooledCredential]:
-        with self._lock:
+        shared = auth_mod.credential_pool_is_globally_shared(self.provider)
+        # Resolve before the shared reload replaces the key that made the request.
+        failed_id = (credential_id or self.entry_id_for_api_key(api_key_hint)) if shared and api_key_hint else None
+        with self._locked_for_mutation():
+            if failed_id:
+                # Another profile may have refreshed this shared credential after our
+                # request went out: retry with its new token instead of benching it.
+                latest = self._find(lambda e: e.id == failed_id)
+                if (
+                    latest is not None
+                    and latest.runtime_api_key
+                    and latest.runtime_api_key != api_key_hint
+                    and latest.last_status not in (STATUS_EXHAUSTED, STATUS_DEAD)
+                    and self._find(lambda e: e.runtime_api_key == api_key_hint) is None
+                ):
+                    logger.info(
+                        "credential pool: failed request used a stale shared credential; "
+                        "adopting refreshed entry %s", latest.label or latest.id[:8],
+                    )
+                    self._current_id = latest.id
+                    return latest
             identity_supplied = bool(credential_id or api_key_hint)
             entry = self._identify_failed_entry(credential_id, api_key_hint)
             if entry is None and identity_supplied:
@@ -2319,7 +2419,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
     def _acquire_lease_under_lock(
         self, credential_id: Optional[str],
     ) -> Tuple[Optional[str], List[PooledCredential]]:
-        with self._lock:
+        with self._locked_for_mutation():
             if credential_id:
                 self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
                 self._current_id = credential_id
@@ -3021,15 +3121,19 @@ def load_pool(provider: str) -> CredentialPool:
         # ``load_pool()`` is a non-destructive read for env-seeded entries
         # (#9331); file-backed singletons still prune when their file is gone.
         borrowing_root_grant = (
-            provider in SINGLE_USE_REFRESH_POOL_PROVIDERS
+            (
+                provider in SINGLE_USE_REFRESH_POOL_PROVIDERS
+                or auth_mod.shared_credential_pool_path(provider) is not None
+            )
             and bool(disk_ids)
             and not _profile_owns_pool_provider(provider)
         )
         if borrowing_root_grant:
-            # Rows read through the global-root fallback are seeded from the
-            # ROOT's singleton files, which this profile cannot see; pruning
-            # them would hide (and, via write-through, delete) the shared
-            # grant. The root's own load_pool() prunes.
+            # Rows read through the global-root fallback (or an opted-in
+            # global pool) are seeded from the ROOT's singleton files, which
+            # this profile cannot see; pruning them would hide (and, via
+            # write-through, delete) the shared grant. The root's own
+            # load_pool() prunes.
             borrowed = [e for e in entries if e.id in disk_ids]
             others = [e for e in entries if e.id not in disk_ids]
             changed |= _prune_stale_seeded_entries(

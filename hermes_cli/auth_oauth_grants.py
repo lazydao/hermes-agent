@@ -338,6 +338,11 @@ def heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str, 
     if provider_id not in SINGLE_USE_REFRESH_POOL_PROVIDERS:
         return None
     try:
+        from hermes_cli.auth import shared_credential_pool_path
+        if shared_credential_pool_path(provider_id) is not None:
+            # Opted into the global pool: root is already the only authority and the profile's
+            # own rows are ignored, not forks to consolidate — never strip or adopt them.
+            return None
         return _heal_forked_single_use_oauth_grants(provider_id)
     except Exception:
         logger.debug("%s: forked-OAuth heal skipped", provider_id, exc_info=True)

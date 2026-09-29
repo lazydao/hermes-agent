@@ -1355,6 +1355,13 @@ credential_pool_strategies:
 
 Options: `fill_first` (default), `round_robin`, `least_used`, `random`. See [Credential Pools](./features/credential-pools.md) for full documentation.
 
+To let several profiles use one pool for a provider, set it to `global` in every participating profile; the pool then lives in the default root's `auth.json` and that profile's own entries for the provider are ignored (see [Opt-in sharing across profiles](./features/credential-pools.md#opt-in-sharing-across-profiles)):
+
+```yaml
+credential_pool_sharing:
+  openai-codex: global
+```
+
 ## Prompt caching
 
 Hermes turns on cross-session prompt caching automatically when the active provider supports it — no user config needed.

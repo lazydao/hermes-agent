@@ -21,7 +21,7 @@ def _cleared_status_copy(entry: PooledCredential) -> PooledCredential:
 class CredentialPoolAdminMixin:
     def reset_status(self, credential_id: str) -> Optional[PooledCredential]:
         """Clear only the target's local error state, preserving sibling cooldowns."""
-        with self._lock:
+        with self._locked_for_mutation():
             entry = self._find(lambda e: e.id == credential_id)
             if entry is None:
                 return None
@@ -39,7 +39,7 @@ class CredentialPoolAdminMixin:
         """
         from agent.credential_pool import _CLEAR_STATUS
 
-        with self._lock:
+        with self._locked_for_mutation():
             stale = [
                 e for e in self._entries
                 if e.last_status or e.last_status_at or e.last_error_code or e.failure_reason or e.model_cooldowns
@@ -59,8 +59,14 @@ class CredentialPoolAdminMixin:
         with self._lock:
             if index < 1 or index > len(self._entries):
                 return None
-            removed = self._entries.pop(index - 1)
-            self._entries = [replace(e, priority=p) for p, e in enumerate(self._entries)]
+            target_id = self._entries[index - 1].id
+        # Resolve by id: a shared pool reloads under the lock and may have been reordered meanwhile.
+        with self._locked_for_mutation():
+            removed = self._find(lambda e: e.id == target_id)
+            if removed is None:
+                return None
+            self._entries = [
+                replace(e, priority=p) for p, e in enumerate(e for e in self._entries if e.id != target_id)]
             persist_pool_entries(
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
@@ -74,7 +80,7 @@ class CredentialPoolAdminMixin:
         """Place an entry at a clamped zero-based position and persist contiguous priorities."""
         from agent.credential_pool import _normalize_pool_priorities
 
-        with self._lock:
+        with self._locked_for_mutation():
             entry = self._find(lambda e: e.id == credential_id)
             if entry is None:
                 return None
@@ -114,13 +120,14 @@ class CredentialPoolAdminMixin:
             return None, None, f'No credential matching "{raw}".'
 
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
-        from agent.credential_pool import _next_priority, write_credential_pool
+        from agent.credential_pool import _next_priority, auth_mod, write_credential_pool
 
-        with self._lock:
+        with self._locked_for_mutation():
             entry = replace(entry, priority=_next_priority(self._entries))
             self._entries.append(entry)
             borrowed_ids = getattr(self, "_borrowed_root_ids", None)
-            if borrowed_ids:
+            # An opted-in global pool adds straight to root: its rows are shared, not borrowed.
+            if borrowed_ids and auth_mod.shared_credential_pool_path(self.provider) is None:
                 # ``hermes -p <profile> auth add <single-use provider>``: the
                 # profile claims its OWN credential. Persist only profile-owned
                 # rows — copying the borrowed root grant alongside would fork
