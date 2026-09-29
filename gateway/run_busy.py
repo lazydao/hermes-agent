@@ -239,6 +239,8 @@ class GatewayBusySessionMixin:
                     # instead of being fenced out of it forever — pruning only reclaims entries whose
                     # PROCESS died.
                     "live_session_id": str(session_key),
+                    # Orphan cleanup scope: a TUI backend in this PID must not reclaim gateway leases.
+                    "lease_owner": "gateway",
                 },
             )
         except Exception as exc:

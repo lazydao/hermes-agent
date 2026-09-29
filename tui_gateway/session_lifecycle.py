@@ -60,10 +60,15 @@ _SESSION_OWNERSHIP_UNAVAILABLE = "Hermes could not safely reserve this session. 
 _AUTOMATIC_SESSION_END_REASONS = frozenset({"ws_orphan_reap", "ws_disconnect", "idle_timeout", "lru_evict", "tui_shutdown"})
 
 
+# ``metadata.lease_owner`` of every TUI/Desktop lease: this PID may also host the messaging gateway, so the
+# orphan sweep and automatic-cleanup guards reclaim only leases carrying this tag.
+_LEASE_OWNER = "tui_gateway"
+
+
 def _lease_metadata(live_session_id: str) -> dict:
     """Writer identity for a lease: ``live_session_id`` is half of ``_is_same_writer``; the delivery flag is
-    what Bot Chat gates live delivery on (session_notifications)."""
-    return {"live_session_id": live_session_id, "bot_live_delivery_consumer": True}
+    what Bot Chat gates live delivery on (session_notifications); ``lease_owner`` scopes orphan cleanup."""
+    return {"live_session_id": live_session_id, "bot_live_delivery_consumer": True, "lease_owner": _LEASE_OWNER}
 
 
 def _claim_active_session_slot(
@@ -258,10 +263,12 @@ def _other_runtime_lease_guard(session_id: str, session: dict):
     def _enter() -> None:
         stack.close()  # drop anything a half-failed previous attempt left behind
         if lease is not None and getattr(lease, "enabled", False):
-            guard = release_active_session_liveness_guard(lease, session_id, own_live_lease_ids=own_live_lease_ids)
+            guard = release_active_session_liveness_guard(
+                lease, session_id, own_live_lease_ids=own_live_lease_ids, owner=_LEASE_OWNER)
         else:
             guard = active_session_liveness_guard(
-                session_id, registry_home=session.get("profile_home"), own_live_lease_ids=own_live_lease_ids)
+                session_id, registry_home=session.get("profile_home"), own_live_lease_ids=own_live_lease_ids,
+                owner=_LEASE_OWNER)
         active[:] = [stack.enter_context(guard)]
 
     if (last_error := _lease_retry(3, _enter)) is not None:

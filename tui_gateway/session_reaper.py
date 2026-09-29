@@ -305,10 +305,11 @@ def _repair_missing_ws_orphan_reaps() -> None:
 
 
 def _reclaim_orphaned_leases() -> None:
-    """Hand the registry the lease ids we still own so it can drop the rest."""
+    """Hand the registry the lease ids we still own so it can drop the rest of OUR leases; this PID may
+    also host the messaging gateway, whose leases carry another ``lease_owner``."""
     try:
         from hermes_cli.active_sessions import release_orphaned_leases
-        if dropped := release_orphaned_leases(_own_live_lease_ids()):
+        if dropped := release_orphaned_leases(_own_live_lease_ids(), owner=_LEASE_OWNER):
             logger.info("Reclaimed %d orphaned active-session lease(s)", dropped)
     except Exception:
         logger.debug("orphaned lease reclaim failed", exc_info=True)
