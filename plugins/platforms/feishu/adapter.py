@@ -3457,6 +3457,12 @@ class FeishuAdapter(BasePlatformAdapter):
         rule = self._group_rules.get(str(chat_id)) if chat_id else None
         if rule is None or rule.policy not in {"open", "allowlist", "blacklist", "admin_only"}:
             return False
+        # The source carries user_id (tenant) > open_id as primary and union_id as alt, not the raw
+        # sender tiers. Positive matches (allowlist/admins) are safe on any tier, but a blacklist of
+        # open_ids can only be proven clear when the primary IS the open_id — otherwise grant nothing
+        # and leave the sender to upstream gating.
+        if rule.policy == "blacklist" and not str(user_id or "").startswith("ou_"):
+            return False
         return self._allow_group_message(SimpleNamespace(open_id=user_id, user_id=user_id_alt), str(chat_id))
 
     def _allow_group_message(self, sender_id: Any, chat_id: str = "", *, is_bot: bool = False) -> bool:

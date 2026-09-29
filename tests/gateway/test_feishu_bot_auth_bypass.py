@@ -135,6 +135,15 @@ def test_group_rule_sender_lists_are_rejudged_at_the_gateway(monkeypatch):
     assert runner._is_user_authorized(_feishu_source("oc_1", "ou_dm_owner")) is True
 
 
+def test_blacklist_group_rule_fails_closed_without_the_open_id(monkeypatch):
+    """With the tenant user_id scope the source's primary id is the tenant id, not the open_id the
+    blacklist names, so a banned sender (e.g. via a reaction, which skips intake) must not be granted."""
+    runner, _adapter = _make_group_rule_runner({"oc_2": {"policy": "blacklist", "blacklist": ["ou_banned"]}})
+
+    assert runner._is_user_authorized(_feishu_source("oc_2", "u_tenant_banned", user_id_alt="on_union")) is False
+    assert runner._is_user_authorized(_feishu_source("oc_2", "ou_guest")) is True
+
+
 def test_group_rules_do_not_make_feishu_an_own_policy_adapter(monkeypatch):
     """Only the exact-rule grant is new: with no env allowlist, DMs and unlisted groups stay denied
     even under ``dm_policy``/``group_policy: allowlist`` (the own-policy trust path is not enabled)."""
