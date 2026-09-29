@@ -9,6 +9,7 @@ anchored on concrete command identifiers — so they cannot fire on prose. Defen
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import re
@@ -563,6 +564,8 @@ def _unreadable_reason(path: Path) -> str:
         metadata = os.stat(path)
     except OSError:
         return f"`{path}` could not be read"
+    if stat.S_ISREG(metadata.st_mode) and not os.access(path, os.R_OK):
+        return f"`{path}` could not be read"
     if not stat.S_ISREG(metadata.st_mode):
         return f"`{path}` is not a regular file"
     return f"`{path}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget"
@@ -959,6 +962,14 @@ def _has_binary_magic(data: bytes) -> bool:
 def _read_referenced_script(
     path: Path, *, max_bytes: Optional[int] = None
 ) -> tuple[Optional[str], bool]:
+    """``(text, unsafe)`` view of :func:`_read_referenced_script_state`."""
+    text, unsafe, _missing = _read_referenced_script_state(path, max_bytes=max_bytes)
+    return text, unsafe
+
+
+def _read_referenced_script_state(
+    path: Path, *, max_bytes: Optional[int] = None
+) -> tuple[Optional[str], bool, bool]:
     """Read a referenced script without racing SQLite connection lifecycle.
 
     The registry check must cover the complete ``open``/``read``/``close``
@@ -972,16 +983,21 @@ def _read_referenced_script(
         with offline_file_access(path, what="read referenced script"):
             return _read_referenced_script_unlocked(path, max_bytes=max_bytes)
     except LiveConnectionError:
-        return None, True
+        return None, True, False
     except (OSError, ValueError):
         # Invalid path values, including embedded NULs, are not scripts.
-        return None, False
+        return None, False, False
 
 
 def _read_referenced_script_unlocked(
     path: Path, *, max_bytes: Optional[int] = None
-) -> tuple[Optional[str], bool]:
-    """Return ``(text, unsafe)`` using bounded, regular-file-only reads.
+) -> tuple[Optional[str], bool, bool]:
+    """Return ``(text, unsafe, missing)`` using bounded, regular-file-only reads.
+
+    ``missing`` is True only when the path does not exist locally — the one case a remote
+    backend may legitimately hold the script. A path this reader already judged (binary,
+    directory, unreadable, over-long, oversized) is never handed to a remote reader: its
+    decoded bytes or a same-named remote file would be scanned in place of what runs here.
 
     Shared choke point for every local script read, so the cloud-placeholder refusal lives here: a
     FileProvider path is never opened — not even to check hydration — because an evicted
@@ -992,14 +1008,19 @@ def _read_referenced_script_unlocked(
     """
     byte_limit = _capped_read_limit(max_bytes)
     if _on_cloud_path(path):
-        return None, True
+        return None, True, False
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except (OSError, ValueError):
-        # OSError: unreadable/missing/over-long. ValueError: embedded NUL in *path*. Either is
-        # "nothing to scan" — never crash the guard.
-        return None, False
+    except (FileNotFoundError, NotADirectoryError):
+        return None, False, True  # not here: a remote backend may have it
+    except ValueError:
+        return None, False, False  # embedded NUL in *path*: not a script, never crash the guard
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            return None, False, False  # cannot name a local script; not forwarded either
+        # Exists locally but cannot be opened: fail closed rather than trusting a remote copy.
+        return None, True, False
     try:
         # ValueError: an embedded NUL byte in *path* itself — a binary's decoded bytes tokenized into a
         # bogus script path by the recursion (#77703).
@@ -1010,7 +1031,7 @@ def _read_referenced_script_unlocked(
         if not stat.S_ISREG(metadata.st_mode):
             # Directories are not scripts (`fpath=(~/.docker/completions …)` in ~/.zshrc must not
             # block `source ~/.zshrc`). Devices/sockets stay fail-closed.
-            return None, not stat.S_ISDIR(metadata.st_mode)
+            return None, not stat.S_ISDIR(metadata.st_mode), False
         # Sniff a small prefix first: compiled binaries are never shell scripts, so skip them
         # WITHOUT reading the rest or feeding decoded garbage into the recursion.
         # Deliberately NOT keyed on the mere presence of a NUL byte (#77927): bash executes a text script
@@ -1018,11 +1039,11 @@ def _read_referenced_script_unlocked(
         # NUL-strip below.
         data = os.read(descriptor, _BINARY_SNIFF_BYTES)
         if _has_binary_magic(data):
-            return None, False
+            return None, False, False
         # A regular file whose size already exceeds the cap fails closed without reading it (the
         # walk budget can be far below 1 MiB).
         if metadata.st_size > byte_limit:
-            return None, True
+            return None, True, False
         # Read the remainder (bounded); loop because os.read may return short.
         while len(data) <= byte_limit:
             chunk = os.read(descriptor, byte_limit + 1 - len(data))
@@ -1030,18 +1051,18 @@ def _read_referenced_script_unlocked(
                 break
             data += chunk
     except OSError:
-        return None, False
+        return None, True, False  # opened but unreadable: fail closed, no remote substitute
     finally:
         os.close(descriptor)
     if _has_binary_magic(data):
-        return None, False
+        return None, False, False
     # Size check BEFORE NUL stripping: stripping shrinks the buffer and would let an oversized file
     # slip under the threshold past this fail-closed branch.
     if len(data) > byte_limit:
-        return None, True
+        return None, True, False
     if b"\x00" in data:
         data = data.replace(b"\x00", b"")
-    return data.decode("utf-8", errors="replace"), False
+    return data.decode("utf-8", errors="replace"), False, False
 
 
 def _sanitize_remote_script_text(
@@ -1069,8 +1090,8 @@ def _sanitize_remote_script_text(
 
 def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
     """``(text, refusal)``: read a cron script with the bounded scanner. Non-regular/oversized/live
-    SQLite inputs fail closed with a NAMED *refusal* (never a lifecycle-shaped verdict); missing or
-    unreadable paths stay empty so scheduler validation reports them."""
+    SQLite/unreadable inputs fail closed with a NAMED *refusal* (never a lifecycle-shaped verdict);
+    missing paths stay empty so scheduler validation reports them."""
     resolved = _resolve_script_path(script_path)
     if resolved is None:
         return "", None
@@ -1142,14 +1163,16 @@ def _contains_unsafe_gateway_action(
         visited.add(resolved)
         # Never read more than the walk can still afford to tokenize; a file larger than the
         # remainder fails closed exactly like an oversized one.
-        script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
+        script_text, unsafe, missing = _read_referenced_script_state(
+            script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
             if candidate_executed:
                 return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
             continue
-        if script_text is None and read_remote_script is not None:
-            # Local path missing; the remote backend's output crosses the same trust boundary as a
-            # local read — sanitize identically (binary skip + size fail-closed).
+        if script_text is None and missing and read_remote_script is not None:
+            # Local path missing (only then — a locally judged binary/unreadable/over-long path is
+            # never re-read remotely); the remote backend's output crosses the same trust boundary
+            # as a local read — sanitize identically (binary skip + size fail-closed).
             if not budget.charge_remote_read():
                 if candidate_executed:
                     return _budget_exhausted(budget, "remote reads", depth)

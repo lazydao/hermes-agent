@@ -795,3 +795,128 @@ async def test_raw_output_modes_are_human_facing(monkeypatch, tmp_path):
         assert "proc_deadbeef" not in text and "[Background process" not in text and "~" not in text
         assert "\x1b[" not in text
         assert "make -j8 all" in text
+
+
+# ---------------------------------------------------------------------------
+# Same-turn polled completion dedupe
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evt_type, coalesced, tagged", [
+    ("completion", False, True), ("completion", True, False), ("watch_match", False, False),
+])
+async def test_injected_completion_names_its_single_process(monkeypatch, tmp_path, evt_type, coalesced, tagged):
+    from gateway.run_notifications import BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    runner.session_store._entries["agent:main:telegram:dm:123"] = SimpleNamespace(
+        origin=SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", user_id="1"))
+    evt = {"type": evt_type, "session_id": "proc_one", "session_key": "agent:main:telegram:dm:123",
+           "message_id": "777", **({"_coalesced": True} if coalesced else {})}
+
+    await runner._inject_watch_notification("[SYSTEM: done]", evt)
+
+    metadata = adapter.handle_message.await_args.args[0].metadata
+    assert (metadata.get(BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY) == "proc_one") is tagged
+
+
+def _completion_event(message_id="m-1", process_id="proc_polled"):
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.run_notifications import BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY
+
+    return MessageEvent(
+        text="[SYSTEM: Background process completed]", message_type=MessageType.TEXT, internal=True,
+        message_id=message_id, metadata={BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY: process_id},
+    )
+
+
+_OK = {"final_response": "the build passed", "completed": True, "messages": []}
+
+
+@pytest.mark.parametrize("result, event, polled, suppressed", [
+    (_OK, _completion_event(), True, True),
+    (_OK, _completion_event(), False, False),                        # never polled: deliver
+    (_OK, _completion_event(message_id="m-2"), True, False),        # another message's process
+    ({**_OK, "final_response": ""}, _completion_event(), True, False),  # no visible answer
+    ({**_OK, "failed": True}, _completion_event(), True, False),     # failed turn
+    (_OK, _completion_event(process_id=""), True, False),           # coalesced / untagged
+])
+def test_same_turn_polled_completion_suppression(monkeypatch, result, event, polled, suppressed):
+    import tools.process_registry as pr_module
+    from gateway.run import _should_suppress_same_turn_polled_process_completion
+
+    registry = pr_module.ProcessRegistry()
+    if polled:
+        registry._poll_observed.add("proc_polled")
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    assert _should_suppress_same_turn_polled_process_completion(result, event, "m-1") is suppressed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("polled, expected_turns", [(True, 1), (False, 2)])
+async def test_drain_drops_completion_the_turn_already_polled(monkeypatch, tmp_path, polled, expected_turns):
+    import importlib
+    import sys
+    import types
+
+    import tools.process_registry as pr_module
+    from gateway.session import SessionSource
+    from tests.gateway.test_run_progress_topics import ProgressCaptureAdapter, _make_runner
+
+    calls = []
+
+    class _Agent:
+        def __init__(self, **kwargs):
+            self.tools = []
+
+        def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+            calls.append(message)
+            return {"final_response": "the build passed", "messages": [], "api_calls": 1, "completed": True}
+
+    registry = pr_module.ProcessRegistry()
+    if polled:
+        registry._poll_observed.add("proc_polled")
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _Agent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group", message_id="m-1")
+    session_key = "agent:main:telegram:group:-1001"
+    pending = _completion_event()
+    pending.source = source
+    adapter._pending_messages[session_key] = pending
+
+    await runner._run_agent(
+        message="build it", context_prompt="", history=[], source=source, session_id="sess-poll",
+        session_key=session_key,
+    )
+
+    assert len(calls) == expected_turns
+
+
+@pytest.mark.asyncio
+async def test_coalesced_completion_batch_is_never_deduped_as_one_process(monkeypatch, tmp_path):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._completion_notification_batch_window = 0
+    runner._deliver_completion_notification = AsyncMock(return_value=True)
+    loop = asyncio.get_running_loop()
+    evts = [{"type": "completion", "session_id": f"proc_{i}", "output": ""} for i in range(2)]
+    runner._completion_notification_batches = {("k",): [("t", e, loop.create_future()) for e in evts]}
+    runner._completion_notification_batch_tasks = {}
+
+    await runner._flush_process_completion_batch(("k",))
+
+    assert all(e.get("_coalesced") for e in evts)

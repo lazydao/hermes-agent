@@ -403,3 +403,88 @@ async def test_shutdown_mcp_servers_nonblocking_completes_fast_path():
         done = await gateway_run._shutdown_mcp_servers_nonblocking(timeout=5)
     assert done is True
     assert calls == [1]
+
+
+# ---------------------------------------------------------------------------
+# systemd stop/restart of this unit is a clean exit; any other SIGTERM is not
+# ---------------------------------------------------------------------------
+
+
+def test_systemd_service_unit_of_self_parses_cgroup_v2():
+    parse = gateway_run._systemd_service_unit_of_self
+    assert parse("0::/user.slice/user-1000.slice/user@1000.service/app.slice/hermes-gateway.service\n") == (
+        "hermes-gateway.service", True)
+    assert parse("0::/system.slice/hermes-gateway.service\n") == ("hermes-gateway.service", False)
+    assert parse("0::/init.scope\n") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_state, expected", [("deactivating", True), ("active", False)])
+async def test_systemd_is_stopping_self_reads_the_units_active_state(monkeypatch, active_state, expected):
+    monkeypatch.setenv("INVOCATION_ID", "inv-1")
+    monkeypatch.setattr(gateway_run, "_systemd_service_unit_of_self", lambda: ("hermes-gateway.service", True))
+    seen = []
+
+    class _Proc:
+        async def communicate(self):
+            return f"{active_state}\n".encode(), b""
+
+    async def fake_exec(*argv, **_kwargs):
+        seen.append(argv)
+        return _Proc()
+
+    monkeypatch.setattr(gateway_run.asyncio, "create_subprocess_exec", fake_exec)
+
+    assert await gateway_run._systemd_is_stopping_self() is expected
+    assert seen == [("systemctl", "--user", "show", "hermes-gateway.service", "--property=ActiveState", "--value")]
+
+
+@pytest.mark.asyncio
+async def test_systemd_is_stopping_self_is_false_outside_systemd(monkeypatch):
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.setattr(gateway_run.asyncio, "create_subprocess_exec", AsyncMock(side_effect=AssertionError))
+    assert await gateway_run._systemd_is_stopping_self() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invocation_id, systemd_stopping, expected_unplanned", [
+    ("inv-1", True, False),    # systemctl stop/restart of this unit -> clean exit
+    ("inv-1", False, True),    # kill -TERM / systemctl kill under systemd -> still unplanned
+    (None, True, True),        # not a systemd unit at all -> never asks, unplanned
+])
+async def test_sigterm_is_clean_only_for_a_systemd_stop_of_this_unit(
+    monkeypatch, invocation_id, systemd_stopping, expected_unplanned,
+):
+    import signal
+    from types import SimpleNamespace
+
+    import gateway.shutdown_forensics as forensics
+    import gateway.status as status
+
+    if invocation_id:
+        monkeypatch.setenv("INVOCATION_ID", invocation_id)
+    else:
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.setattr(status, "consume_takeover_marker_for_self", lambda: False)
+    monkeypatch.setattr(status, "consume_planned_stop_marker_for_self", lambda: False)
+    monkeypatch.setattr(forensics, "snapshot_shutdown_context", lambda *a, **k: None)
+    checked = []
+
+    async def fake_check():
+        checked.append(True)
+        return systemd_stopping
+
+    monkeypatch.setattr(gateway_run, "_systemd_is_stopping_self", fake_check)
+    stopped = asyncio.Event()
+
+    async def _stop():
+        stopped.set()
+
+    runner = SimpleNamespace(_signal_initiated_shutdown=False, stop=_stop)
+    flag = [False]
+    gateway_run._start_gateway_make_shutdown_signal_handler(runner, flag)(signal.SIGTERM)
+    await asyncio.wait_for(stopped.wait(), timeout=2)
+
+    assert flag[0] is expected_unplanned
+    assert runner._signal_initiated_shutdown is expected_unplanned
+    assert bool(checked) is bool(invocation_id)

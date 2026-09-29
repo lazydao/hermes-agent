@@ -28,6 +28,10 @@ from gateway.run_shutdown import _log_suppressed, _notice_target_key, _send_erro
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Internal-event metadata: the ONE background process a completion turn reports (see
+# gateway.run._should_suppress_same_turn_polled_process_completion).
+BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY = "background_process_completion_session_id"
+
 # A failed /update leaves the previous version running; the full pip/git log stays on the host
 # (`hermes update` re-runs it in the terminal) and only a short tail is quoted in chat.
 _UPDATE_FAILED_NOTICE = (
@@ -1332,6 +1336,9 @@ class GatewayNotificationsMixin:
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            if evt.get("type") == "completion" and not evt.get("_coalesced") and evt.get("session_id"):
+                # One process per turn: lets the drain drop it if the launching turn already polled it.
+                metadata[BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY] = str(evt["session_id"])
             # The continuation turn shares the originating request's iteration budget.
             if isinstance(evt.get(REQUEST_CHAIN_BUDGET_EVENT_KEY), IterationBudget):
                 metadata[REQUEST_CHAIN_BUDGET_EVENT_KEY] = evt[REQUEST_CHAIN_BUDGET_EVENT_KEY]
@@ -1676,6 +1683,9 @@ class GatewayNotificationsMixin:
             if not entries:
                 return
             synth_text = entries[0][0] if len(entries) == 1 else self._format_coalesced_process_completions(entries)
+            if len(entries) > 1:
+                for _text, evt, _future in entries:
+                    evt["_coalesced"] = True  # the turn covers several processes: never deduped as one
             # A duplicate primary returns None from the dedupe seam; try the next identity so a fresh
             # sibling is never discarded with it.
             delivered = None

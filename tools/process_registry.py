@@ -1667,6 +1667,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
 
+    def was_completion_polled(self, session_id: str) -> bool:
+        """Whether a terminal completion was observed through ``poll()``. Poll stays read-only for
+        autonomous notification; the gateway uses this narrower signal only to drop a queued
+        completion turn for the same originating message whose turn already polled it."""
+        return session_id in self._poll_observed
+
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop (``hermes_cli.goals`` wait barrier) should stay parked on
         this session: still running AND, with ``watch_patterns``, none matched yet (a

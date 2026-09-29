@@ -3649,12 +3649,21 @@ class GatewayTurnMixin:
 
         Keyed by session_key (not source.chat_id) to match the adapter's storage keys."""
         from gateway.run import (
-            _build_media_placeholder, _dequeue_pending_event, _is_control_interrupt_message
+            _build_media_placeholder, _dequeue_pending_event, _is_control_interrupt_message,
+            _should_suppress_same_turn_polled_process_completion,
         )
         pending_event = None
         pending = None
         if result and adapter and session_key:
             pending_event = _dequeue_pending_event(adapter, session_key)
+            if _should_suppress_same_turn_polled_process_completion(
+                result, pending_event, getattr(source, "message_id", None),
+            ):
+                logger.info(
+                    "Suppressing queued completion turn for %s: this turn already polled it to exit",
+                    pending_event.metadata.get("background_process_completion_session_id"),
+                )
+                pending_event = None
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
