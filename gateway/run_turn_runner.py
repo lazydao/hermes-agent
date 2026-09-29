@@ -1978,6 +1978,7 @@ class TurnRunner:
             "failed": result.get("failed", False), "failure_reason": result.get("failure_reason"),
             "partial": result.get("partial", False), "completed": result.get("completed"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
+            "turn_exit_reason": result.get("turn_exit_reason"),
             "error": result.get("error"),
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),

@@ -2614,6 +2614,15 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     return adapter.get_pending_message(session_key)
 
 
+def _should_defer_internal_iteration_limit_response(result: Any, pending_event: MessageEvent | None) -> bool:
+    """Hold a max-iterations handoff while the queued INTERNAL continuation runs: the chain's
+    final answer supersedes it. A real user follow-up still gets the handoff first."""
+    if pending_event is None or not bool(getattr(pending_event, "internal", False)):
+        return False
+    from agent.turn_failure_copy import is_max_iteration_handoff
+    return is_max_iteration_handoff(result)
+
+
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"

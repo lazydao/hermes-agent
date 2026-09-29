@@ -958,6 +958,33 @@ class QueuedFailedEmptyAgent:
         }
 
 
+class QueuedIterationLimitAgent:
+    """First turn ends on the iteration-cap handoff; the queued event completes the task."""
+
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        type(self).calls += 1
+        if type(self).calls == 1:
+            return {
+                "final_response": "stage result",
+                "messages": [],
+                "api_calls": 60,
+                "completed": False,
+                "turn_exit_reason": "max_iterations_reached(60/60)",
+            }
+        return {
+            "final_response": "final result",
+            "messages": [],
+            "api_calls": 2,
+            "completed": True,
+            "turn_exit_reason": "text_response(finish_reason=stop)",
+        }
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -1001,6 +1028,7 @@ async def _run_with_agent(
     *,
     session_id,
     pending_text=None,
+    pending_internal=False,
     config_data=None,
     platform=Platform.TELEGRAM,
     chat_id="-1001",
@@ -1047,6 +1075,7 @@ async def _run_with_agent(
             message_type=MessageType.TEXT,
             source=source,
             message_id="queued-1",
+            internal=pending_internal,
         )
 
     result = await runner._run_agent(
@@ -2006,3 +2035,33 @@ class TestSlackReplyInThreadProgressRouting:
             event_message_id="evt-trigger-001",
             reply_in_thread=True,
         ) == "evt-trigger-001"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_defers_iteration_limit_reply_for_internal_followup(monkeypatch, tmp_path):
+    QueuedIterationLimitAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, QueuedIterationLimitAgent,
+        session_id="sess-internal-limit-followup",
+        pending_text="[SYSTEM: Background process completed]", pending_internal=True,
+    )
+
+    sent_texts = [call["content"] for call in adapter.sent]
+    assert QueuedIterationLimitAgent.calls == 2
+    assert result["final_response"] == "final result"
+    assert "stage result" not in sent_texts
+
+
+@pytest.mark.asyncio
+async def test_run_agent_keeps_iteration_limit_reply_before_user_followup(monkeypatch, tmp_path):
+    QueuedIterationLimitAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, QueuedIterationLimitAgent,
+        session_id="sess-user-limit-followup",
+        pending_text="new user question", pending_internal=False,
+    )
+
+    sent_texts = [call["content"] for call in adapter.sent]
+    assert QueuedIterationLimitAgent.calls == 2
+    assert result["final_response"] == "final result"
+    assert "stage result" in sent_texts
