@@ -251,3 +251,136 @@ def test_streamed_interim_then_different_summary_not_marked_previewed(agent, mon
     # CRITICAL: response_previewed must be False — the interim narration was
     # NOT the final response, so the CLI must render the summary.
     assert result["response_previewed"] is False
+
+
+def _pre_response_patches(directive):
+    return (
+        patch("hermes_cli.plugins.has_hook", side_effect=lambda name: name == "pre_response"),
+        patch(
+            "hermes_cli.plugins.get_pre_response_directive",
+            **({"side_effect": directive} if isinstance(directive, list) else {"return_value": directive}),
+        ),
+        patch("agent.response_hooks.max_pre_response_nudges", return_value=2),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    )
+
+
+def test_pre_response_guard_uses_safe_fallback_at_budget_limit(agent, monkeypatch):
+    agent._interruptible_api_call = lambda _kwargs: _response("premature confirmation")
+    agent._handle_max_iterations = MagicMock(return_value="unsafe summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+    emitted = []
+    agent.interim_assistant_callback = lambda text, **kw: emitted.append(text)
+
+    has_hook, directive, bound, invoke = _pre_response_patches({
+        "action": "continue", "message": "persist the correction first",
+        "fallback": "The correction was not persisted, so it is not confirmed.",
+    })
+    with has_hook, directive as get_directive, bound, invoke:
+        result = agent.run_conversation("record this", persist_user_platform_id="om_123")
+
+    assert result["final_response"] == "The correction was not persisted, so it is not confirmed."
+    assert result["turn_exit_reason"] == "max_iterations_reached(1/1)"
+    assert result["completed"] is False
+    agent._handle_max_iterations.assert_not_called()
+    # The withheld answer is never shown and its scaffolding pair never outlives the turn.
+    assert emitted == []
+    assert [(m["role"], m["content"]) for m in result["messages"]] == [
+        ("user", "record this"),
+        ("assistant", "The correction was not persisted, so it is not confirmed."),
+    ]
+    kwargs = get_directive.call_args.kwargs
+    assert kwargs["attempt"] == 0
+    assert kwargs["final_response"] == "premature confirmation"
+    assert kwargs["platform_message_id"] == "om_123"
+    assert kwargs["turn_id"] == agent._current_turn_id
+
+
+def test_pre_response_guard_allows_later_verified_response(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    answers = iter([_response("premature confirmation"), _response("verified confirmation")])
+    sent = []
+
+    def model_call(api_kwargs):
+        sent.append([dict(m) for m in api_kwargs["messages"]])
+        return next(answers)
+
+    agent._interruptible_api_call = model_call
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    has_hook, directive, bound, invoke = _pre_response_patches([
+        {"action": "continue", "message": "persist the correction first", "fallback": "not persisted"},
+        None,
+    ])
+    with has_hook, directive, bound, invoke:
+        result = agent.run_conversation("record this")
+
+    assert result["final_response"] == "verified confirmation"
+    assert result["completed"] is True
+    # Cache safety: the second request extends the first byte-for-byte with exactly one
+    # alternating assistant + synthetic-user pair.
+    first, second = sent
+    assert second[: len(first)] == first
+    assert [(m["role"], m["content"]) for m in second[len(first):]] == [
+        ("assistant", "premature confirmation"),
+        ("user", "persist the correction first"),
+    ]
+    assert [(m["role"], m["content"]) for m in result["messages"]] == [
+        ("user", "record this"), ("assistant", "verified confirmation"),
+    ]
+
+
+def test_pre_response_replace_delivers_hook_message(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    agent._interruptible_api_call = lambda _kwargs: _response("I changed the protected file.")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    has_hook, directive, bound, invoke = _pre_response_patches(
+        {"action": "replace", "message": "I cannot confirm that change."},
+    )
+    with has_hook, directive, bound, invoke:
+        result = agent.run_conversation("change it")
+
+    assert result["final_response"] == "I cannot confirm that change."
+    assert result["completed"] is True
+    assert result["messages"][-1]["content"] == "I cannot confirm that change."
+
+
+def test_pre_response_continue_past_bound_delivers_fallback(agent, monkeypatch):
+    agent.max_iterations = 5
+    agent.iteration_budget.max_total = 5
+    calls = []
+    agent._interruptible_api_call = lambda _kwargs: calls.append(1) or _response("premature confirmation")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    has_hook, directive, bound, invoke = _pre_response_patches(
+        {"action": "continue", "message": "persist first", "fallback": "Not persisted."},
+    )
+    with has_hook, directive, bound, invoke:
+        result = agent.run_conversation("record this")
+
+    # max_pre_response_nudges=2: two continuations, then the fallback replaces the third answer.
+    assert len(calls) == 3
+    assert result["final_response"] == "Not persisted."
+    assert [(m["role"], m["content"]) for m in result["messages"]] == [
+        ("user", "record this"), ("assistant", "Not persisted."),
+    ]
+
+
+def test_pre_response_hook_failure_lets_response_through(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    agent._interruptible_api_call = lambda _kwargs: _response("answer")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", side_effect=lambda name: name == "pre_response"),
+        patch("hermes_cli.plugins.get_pre_response_directive", side_effect=RuntimeError("boom")),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("q")
+
+    assert result["final_response"] == "answer"
+    assert result["completed"] is True

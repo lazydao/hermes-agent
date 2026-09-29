@@ -16,7 +16,7 @@ from agent.reasoning_promotion import answer_in_reasoning_capability
 from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
 from agent.turn_failure_copy import stamp_failure
 from agent.turn_empty_response import recover_empty_response
-from agent.turn_stop_gates import apply_stop_gates
+from agent.turn_stop_gates import apply_pre_response_gate, apply_stop_gates
 from agent.turn_truncation import partial_result, repetition_copy
 
 _REPETITION_STOPPED = repetition_copy(
@@ -50,6 +50,7 @@ class FinalResponseVerdict:
     _pending_verification_response: Any
     _pending_verification_response_previewed: Any
     api_call_count: int
+    _pending_pre_response_fallback: Any
     result: Optional[dict[str, Any]] = None
 
 
@@ -61,6 +62,7 @@ def finish_text_response(
     truncated_response_parts: Any, length_continue_retries: Any,
     _pending_verification_response: Any, _pending_verification_response_previewed: Any,
     effective_task_id: Any,
+    original_user_message: Any = None, _pending_pre_response_fallback: Any = None,
 ) -> FinalResponseVerdict:
     """Finish (or defer) a text-only assistant response in the original guard order. Every
     continuation path sets ``final_response = None`` so an acknowledgment never suppresses
@@ -82,6 +84,7 @@ def finish_text_response(
             _pending_verification_response=_pending_verification_response,
             _pending_verification_response_previewed=_pending_verification_response_previewed,
             api_call_count=api_call_count,
+            _pending_pre_response_fallback=_pending_pre_response_fallback,
             result=result,
         )
 
@@ -339,6 +342,18 @@ def finish_text_response(
     _pending_verification_response_previewed = _sg.pending_verification_response_previewed
     if _sg.continue_turn:
         final_response = None
+        return _verdict("continue")
+
+    # Final-response policy gate: runs on any accepted answer, before the output transform
+    # and the durable append (a withheld answer never becomes transcript).
+    _rg = apply_pre_response_gate(
+        agent, final_msg, final_response=final_response, messages=messages,
+        user_message=original_user_message if original_user_message is not None else user_message,
+        pending_pre_response_fallback=_pending_pre_response_fallback,
+    )
+    _pending_pre_response_fallback = _rg.pending_pre_response_fallback
+    final_response = _rg.final_response
+    if _rg.continue_turn:
         return _verdict("continue")
 
     # Plugins rewrite the reply BEFORE it is appended and flushed: SQLite treats a non-blank
