@@ -424,9 +424,12 @@ def _dispatch_background(batch: _Batch) -> str:
 
     parent_agent = batch.parent_agent
     session_key, origin_ui_session_id = _resolve_async_session_key(parent_agent, batch.origin_ui_session_id)
+    from agent.iteration_budget import request_chain_budget_of
     routing = dict(
         session_key=session_key, origin_ui_session_id=origin_ui_session_id, origin_session_id=wake_sid,
         parent_session_id=getattr(parent_agent, "session_id", None), max_async_children=_get_max_async_children(),
+        # The completion turn continues this request on the same iteration budget.
+        request_chain_budget=request_chain_budget_of(parent_agent),
     )
 
     units = _units_of(batch)

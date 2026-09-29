@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, cast
 
+from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY, IterationBudget
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
@@ -1331,6 +1332,9 @@ class GatewayNotificationsMixin:
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            # The continuation turn shares the originating request's iteration budget.
+            if isinstance(evt.get(REQUEST_CHAIN_BUDGET_EVENT_KEY), IterationBudget):
+                metadata[REQUEST_CHAIN_BUDGET_EVENT_KEY] = evt[REQUEST_CHAIN_BUDGET_EVENT_KEY]
             synth_event = MessageEvent(
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None, metadata=metadata,
@@ -2000,6 +2004,8 @@ class GatewayNotificationsMixin:
             "parent_session_id": (
                 watcher.get("parent_session_id") or getattr(session, "parent_session_id", "") or ""
             ),
+            # Process-local: the completion turn continues the request that started the process.
+            REQUEST_CHAIN_BUDGET_EVENT_KEY: getattr(session, "request_chain_budget", None),
         }
 
     def _format_process_final_message(self, session_id: str, session, notify_mode: str) -> str:

@@ -575,8 +575,10 @@ _PER_TURN_RESET_STATE: Tuple[Tuple[str, Any], ...] = (
 )
 
 
-def _reset_per_turn_agent_state(agent: Any) -> None:
-    """Reset retry counters, guardrails, iteration and run budgets at turn start."""
+def _reset_per_turn_agent_state(agent: Any, iteration_budget: Optional[IterationBudget] = None) -> None:
+    """Reset retry counters, guardrails, iteration and run budgets at turn start. A supplied
+    ``iteration_budget`` is the gateway's request-chain budget and is adopted as-is (an internal
+    continuation keeps the originating request's usage); otherwise the turn gets a fresh one."""
     for name, value in _PER_TURN_RESET_STATE:
         setattr(agent, name, value)
     agent._turn_failed_file_mutations = {}
@@ -605,7 +607,10 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
         agent._replay_compression_warning()
         agent._compression_warning = None  # send once
 
-    agent.iteration_budget = IterationBudget(agent.max_iterations)
+    agent.iteration_budget = (
+        iteration_budget if isinstance(iteration_budget, IterationBudget)
+        else IterationBudget(agent.max_iterations)
+    )
     # Wall-clock run budget: stamped only when configured (one wrap-up notice per run).
     agent._run_budget_started_at = (
         time.time() if getattr(agent, "run_budget_seconds", None) else None
@@ -983,6 +988,7 @@ def build_turn_context(
     persist_user_message: Optional[Any], persist_user_timestamp: Optional[float]=None,
     persist_user_platform_id: Optional[str]=None, *, persist_user_display_kind: Optional[str]=None,
     persist_user_display_metadata: Optional[Dict[str, Any]]=None, turn_author: Optional[Dict[str, Any]]=None,
+    iteration_budget: Optional[IterationBudget]=None,
     restore_or_build_system_prompt,
     install_safe_stdio, sanitize_surrogates, summarize_user_message_for_log, set_session_context,
     set_current_write_origin, ra, moa_active: bool=False,
@@ -1032,7 +1038,7 @@ def build_turn_context(
         agent, task_id, stream_callback, persist_user_message,
         persist_user_timestamp, persist_user_platform_id,
     )
-    _reset_per_turn_agent_state(agent)
+    _reset_per_turn_agent_state(agent, iteration_budget)
 
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = _preview_text[:80] + ("..." if len(_preview_text) > 80 else "")

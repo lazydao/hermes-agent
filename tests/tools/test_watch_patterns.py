@@ -74,6 +74,16 @@ class TestCheckWatchPatterns:
         assert evt["session_id"] == "proc_test_watch"
 
 
+    def test_match_carries_originating_request_budget(self, registry):
+        from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY, IterationBudget
+
+        budget = IterationBudget(90)
+        session = _make_session(watch_patterns=["ERROR"])
+        session.request_chain_budget = budget
+        registry._check_watch_patterns(session, "ERROR: disk full\n")
+
+        assert registry.completion_queue.get_nowait()[REQUEST_CHAIN_BUDGET_EVENT_KEY] is budget
+
     def test_output_truncation(self, registry):
         """Very long matched output is truncated."""
         session = _make_session(watch_patterns=["X"])

@@ -53,6 +53,9 @@ class TurnContext:
     event_message_id: Optional[str] = None
     # Raw inbound platform id (not the event_message_id reply anchor); stamped on the user turn.
     inbound_message_id: Optional[str] = None
+    # IterationBudget shared by one user request's internal continuation turns; None → run_sync
+    # starts a fresh one (and every internal continuation of this turn inherits it).
+    request_chain_budget: Any = None
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None

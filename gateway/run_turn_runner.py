@@ -1721,6 +1721,8 @@ class TurnRunner:
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
+            if ctx.request_chain_budget is not None and _accepts_keyword(agent.run_conversation, "iteration_budget"):
+                kwargs["iteration_budget"] = ctx.request_chain_budget
             from agent.notification_presentation import notification_turn
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 return agent.run_conversation(api_message, **kwargs)
@@ -1907,6 +1909,10 @@ class TurnRunner:
         platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
         combined_ephemeral = self._combined_ephemeral_prompt()
         max_iterations = _current_max_iterations()
+        if ctx.request_chain_budget is None:
+            # A user turn opens a request chain; its internal continuations reuse this budget.
+            from agent.iteration_budget import IterationBudget
+            ctx.request_chain_budget = IterationBudget(max_iterations)
         try:
             model, runtime_kwargs = runner._resolve_session_agent_runtime(
                 source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,

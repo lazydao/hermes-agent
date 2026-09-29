@@ -20,6 +20,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
+from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY
 from hermes_constants import get_hermes_home, hermes_home_key
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
@@ -671,6 +672,7 @@ def _dispatch_admitted(
     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
     task_indexes: Optional[List[int]] = None,
     task_transcripts: Optional[Dict[str, str]] = None,
+    request_chain_budget: Any = None,
 ) -> Dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
@@ -699,7 +701,10 @@ def _dispatch_admitted(
         # a forced finalization runs under the dispatcher's so it settles the same state.db.
         "_context": contextvars.copy_context(),
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
-        "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None}
+        "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None,
+        # Process-local: the completion turn continues the dispatching request's budget. The key is
+        # ``_``-prefixed, so status listings and the durable row never carry it.
+        REQUEST_CHAIN_BUDGET_EVENT_KEY: request_chain_budget}
     with _records_lock:
         active_slots = {r.get("slot_key") or r["delegation_id"] for r in _records.values() if r.get("status") in _ACTIVE_STATES}
         if record["slot_key"] not in active_slots and len(active_slots) >= max_async_children:
@@ -753,6 +758,7 @@ def dispatch_async_delegation(
     session_key: str, parent_session_id: Optional[str] = None, runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "", origin_session_id: str = "", interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, progress_fn: Optional[Callable[[], tuple]] = None,
+    request_chain_budget: Any = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
@@ -766,6 +772,7 @@ def dispatch_async_delegation(
         parent_session_id=parent_session_id, runner=runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn,
+        request_chain_budget=request_chain_budget,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or run this task synchronously (background=false). "
@@ -784,6 +791,7 @@ def dispatch_async_delegation_batch(
     progress_fn: Optional[Callable[[], tuple]] = None, slot_key: Optional[str] = None,
     task_indexes: Optional[List[int]] = None,
     task_transcripts: Optional[Dict[str, str]] = None,
+    request_chain_budget: Any = None,
 ) -> Dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
@@ -802,6 +810,7 @@ def dispatch_async_delegation_batch(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         task_indexes=task_indexes, task_transcripts=task_transcripts,
+        request_chain_budget=request_chain_budget,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
@@ -879,6 +888,8 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
     except Exception as exc:  # noqa: BLE001 — a lost durable row is recoverable; a lost result + leaked slot is not
         logger.error(f"Async delegation{label} %s: durable completion write failed; delivering in-memory "
                      "only (a restart may report this unit as unknown): %s", record.get("delegation_id"), exc)
+    # Attached only after the durable (JSON) write: the budget is a live, process-local object.
+    evt[REQUEST_CHAIN_BUDGET_EVENT_KEY] = record.get(REQUEST_CHAIN_BUDGET_EVENT_KEY)
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -914,7 +925,8 @@ def push_task_failure_notice(delegation_id: str, entry: Dict[str, Any], *, n_tas
         "goal": snapshot.get("goal", ""), "goals": snapshot.get("goals"), "context": snapshot.get("context"),
         "toolsets": snapshot.get("toolsets"), "role": snapshot.get("role"), "model": snapshot.get("model"),
         "status": "running", "dispatched_at": snapshot.get("dispatched_at") or time.time(), "completed_at": time.time(),
-        **{k: snapshot[k] for k in _ROUTING_KEYS if snapshot.get(k)}}
+        **{k: snapshot[k] for k in _ROUTING_KEYS if snapshot.get(k)},
+        REQUEST_CHAIN_BUDGET_EVENT_KEY: snapshot.get(REQUEST_CHAIN_BUDGET_EVENT_KEY)}
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover

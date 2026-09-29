@@ -3,12 +3,19 @@
 Each ``AIAgent`` (parent or subagent) holds its own :class:`IterationBudget`: the parent's
 cap is ``max_iterations`` (default 500), each subagent's ``delegation.max_iterations``
 (default 50), so total iterations across parent + subagents can exceed the parent's cap.
+The gateway passes ONE parent budget through every internal continuation turn of a user request
+(async-delegation completion, background-process notify/watch events, queued internal events,
+a leftover /steer), so a synthetic follow-up cannot silently reset the request's cap.
 """
 
 from __future__ import annotations
 
 import math
 import threading
+
+# Runtime-only key carrying a request-chain ``IterationBudget`` on completion events and on
+# internal ``MessageEvent.metadata``. Never serialized (the value holds a lock).
+REQUEST_CHAIN_BUDGET_EVENT_KEY = "_request_chain_iteration_budget"
 
 
 def normalize_budget_warning_ratio(value) -> float | None:
@@ -56,4 +63,29 @@ class IterationBudget:
             return max(0, self.max_total - self._used)
 
 
-__all__ = ["IterationBudget"]
+def request_chain_budget_of(agent) -> "IterationBudget | None":
+    """The request-chain budget that owns work started by *agent*: the ROOT agent's budget. A
+    delegated child's own budget (``delegation.max_iterations``) must never become the cap of the
+    parent's completion turn, so walk ``_delegate_parent_ref`` up to the top-level agent."""
+    seen = 0
+    while agent is not None and getattr(agent, "_delegate_depth", 0) and seen < 16:
+        ref = getattr(agent, "_delegate_parent_ref", None)
+        agent = ref() if callable(ref) else None
+        seen += 1
+    budget = getattr(agent, "iteration_budget", None) if agent is not None else None
+    return budget if isinstance(budget, IterationBudget) else None
+
+
+def current_request_chain_budget() -> "IterationBudget | None":
+    """:func:`request_chain_budget_of` for the agent whose turn runs in this execution context."""
+    try:
+        from agent.subagent_lifecycle import get_active_subagent_parent
+    except Exception:
+        return None
+    return request_chain_budget_of(get_active_subagent_parent())
+
+
+__all__ = [
+    "IterationBudget", "REQUEST_CHAIN_BUDGET_EVENT_KEY", "current_request_chain_budget",
+    "request_chain_budget_of",
+]

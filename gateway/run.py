@@ -2614,6 +2614,33 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     return adapter.get_pending_message(session_key)
 
 
+def _request_chain_budget_from_event(event: MessageEvent | None) -> Any:
+    """The originating request's ``IterationBudget`` carried by an INTERNAL event, else ``None``.
+    External events never carry one (the key is runtime-only and type-checked here)."""
+    from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY, IterationBudget
+    if event is None or not bool(getattr(event, "internal", False)):
+        return None
+    metadata = getattr(event, "metadata", None)
+    budget = metadata.get(REQUEST_CHAIN_BUDGET_EVENT_KEY) if isinstance(metadata, dict) else None
+    return budget if isinstance(budget, IterationBudget) else None
+
+
+def _request_chain_budget_for_followup(
+    current_budget: Any, pending_event: MessageEvent | None, *, leftover_steer: bool = False,
+) -> Any:
+    """Budget for a recursively drained follow-up turn: an internal event continues its own
+    originating request (or, without one, the current request); a leftover /steer continues the
+    current request; a real queued user message or interrupt starts a fresh request (``None``)."""
+    event_budget = _request_chain_budget_from_event(pending_event)
+    if event_budget is not None:
+        return event_budget
+    if pending_event is not None and bool(getattr(pending_event, "internal", False)):
+        return current_budget
+    if pending_event is None and leftover_steer:
+        return current_budget
+    return None
+
+
 def _should_defer_internal_iteration_limit_response(result: Any, pending_event: MessageEvent | None) -> bool:
     """Hold a max-iterations handoff while the queued INTERNAL continuation runs: the chain's
     final answer supersedes it. A real user follow-up still gets the handoff first."""

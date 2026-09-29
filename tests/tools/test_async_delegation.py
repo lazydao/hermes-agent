@@ -567,6 +567,9 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
+    from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY, IterationBudget
+    parent.iteration_budget = IterationBudget(90)
+    assert parent.iteration_budget.consume()
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
@@ -613,9 +616,36 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert evt.get("is_batch") is True
     assert len(evt["results"]) == 1
     assert evt["results"][0]["summary"] == "done: the real task"
+    # The completion turn continues the dispatching request's iteration budget...
+    assert evt[REQUEST_CHAIN_BUDGET_EVENT_KEY] is parent.iteration_budget
+    # ...but the live budget object never reaches a JSON surface (status list, durable row).
+    json.dumps(ad.list_async_delegations())
+    assert REQUEST_CHAIN_BUDGET_EVENT_KEY not in json.dumps(ad.get_durable_delegation(evt["delegation_id"]))
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+
+
+def test_task_failure_notice_carries_request_chain_budget():
+    from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY, IterationBudget
+
+    budget = IterationBudget(90)
+    gate = threading.Event()
+    handle = ad.dispatch_async_delegation_batch(
+        goals=["a", "b"], context=None, toolsets=None, role="leaf", model="m", session_key="agent:main:x",
+        runner=lambda: gate.wait(timeout=60) and {"results": []}, request_chain_budget=budget,
+    )
+    try:
+        assert handle["status"] == "dispatched"
+        ad.push_task_failure_notice(
+            handle["delegation_id"], {"task_index": 0, "status": "error", "error": "401"}, n_tasks=2,
+        )
+        evt = _drain_one()
+        assert evt["task_failure_notice"] is True
+        assert evt[REQUEST_CHAIN_BUDGET_EVENT_KEY] is budget
+    finally:
+        gate.set()
+        _drain_one()
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
