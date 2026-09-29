@@ -3003,6 +3003,15 @@ Hermes uses two different context scopes:
 - Hermes automatically seeds a default `SOUL.md` if one does not already exist.
 - All loaded context files are capped at `context_file_max_chars` characters (default 20,000) with smart truncation.
 
+To reuse one prompt fragment across profiles, list files in `agent.system_prompt_files`. Their contents are prepended, in order, to the session overlay (the active personality or `agent.system_prompt`) on the CLI, TUI and gateway; relative paths resolve against the profile's Hermes home, and a missing file is skipped with a warning:
+
+```yaml
+agent:
+  system_prompt_files:
+    - /path/to/shared-rules.md
+  system_prompt: "Profile-specific role"
+```
+
 See also:
 - [Personality & SOUL.md](./features/personality.md)
 - [Context Files](./features/context-files.md)

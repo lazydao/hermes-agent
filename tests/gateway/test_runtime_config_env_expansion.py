@@ -39,3 +39,40 @@ def test_load_prefill_messages_prefers_top_level_over_legacy(monkeypatch, gatewa
     assert gateway_run.GatewayRunner._load_prefill_messages() == top_level
 
 
+
+
+def test_load_system_prompt_prepends_configured_files(gateway_home):
+    (gateway_home / "shared-one.md").write_text("shared one\n", encoding="utf-8")
+    (gateway_home / "shared-two.md").write_text("shared two\n", encoding="utf-8")
+    _write_config(
+        gateway_home,
+        "agent:\n"
+        "  system_prompt_files:\n"
+        "    - shared-one.md\n"
+        f"    - {gateway_home / 'shared-two.md'}\n"
+        "  system_prompt: profile-specific\n",
+    )
+
+    assert gateway_run.GatewayRunner._load_ephemeral_system_prompt() == (
+        "shared one\n\nshared two\n\nprofile-specific"
+    )
+
+
+def test_load_system_prompt_files_follow_the_serving_profile(gateway_home):
+    """Multiplex: relative prompt files resolve in the routed profile's home, A->B->A."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile = gateway_home / "profiles" / "client"
+    profile.mkdir(parents=True)
+    for home, text in ((gateway_home, "launch rules"), (profile, "client rules")):
+        (home / "rules.md").write_text(text, encoding="utf-8")
+        _write_config(home, "agent:\n  system_prompt_files: [rules.md]\n")
+
+    load = gateway_run.GatewayRunner._load_ephemeral_system_prompt
+    assert load() == "launch rules"
+    token = set_hermes_home_override(profile)
+    try:
+        assert load() == "client rules"
+    finally:
+        reset_hermes_home_override(token)
+    assert load() == "launch rules"

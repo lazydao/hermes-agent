@@ -91,12 +91,15 @@ class GatewayConfigLoadersMixin:
 
     @staticmethod
     def _load_ephemeral_system_prompt() -> str:
-        """HERMES_EPHEMERAL_SYSTEM_PROMPT env first, then ``display.personality`` / ``agent.system_prompt``."""
-        from gateway.run import _load_gateway_config
+        """HERMES_EPHEMERAL_SYSTEM_PROMPT env first, then ``agent.system_prompt_files`` plus
+        ``display.personality`` / ``agent.system_prompt``; relative prompt files resolve against
+        the serving profile's home."""
+        from gateway.run import _gateway_config_home, _load_gateway_config
         prompt = os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
         if prompt:
             return prompt
-        return resolve_ephemeral_system_prompt_from_config(_load_gateway_config())
+        return resolve_ephemeral_system_prompt_from_config(
+            _load_gateway_config(), base_dir=_gateway_config_home())
 
     def _channel_override(self, platform: Platform, chat_id: str, thread_id, parent_id):
         """``channel_overrides`` entry for this channel/thread, or None (also when no config is bound)."""

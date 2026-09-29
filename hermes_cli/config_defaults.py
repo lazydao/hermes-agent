@@ -140,6 +140,10 @@ DEFAULT_CONFIG = {
         # Responses API final-answer length (`text.verbosity`): "" = not sent (provider default),
         # or low | medium | high. Responses-family transports only; chat_completions never sends it.
         "text_verbosity": "",
+        # Prompt fragments prepended, in order, to the ephemeral overlay (before
+        # agent.system_prompt / the active personality). Relative paths resolve
+        # against the profile's Hermes home.
+        "system_prompt_files": [],
         # System-prompt guidance telling the model to call tools instead of describing actions.
         # "auto" = gpt/codex models; true/false = force for all models; or a list of model-name
         # substrings (e.g. ["gpt", "codex", "gemini", "qwen"]).

@@ -5,12 +5,17 @@
 * ``agent.personalities`` holds user-defined/overridden personalities, overlaying built-ins by name.
   The schema also exposes a top-level ``personalities:`` block (the original #643 shape); both are
   honoured, ``agent.personalities`` winning on a name clash.
+* ``agent.system_prompt_files`` are user-owned prompt fragments prepended to the overlay.
 """
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 #: Names that mean "no personality overlay".
 NEUTRAL_PERSONALITY_NAMES = frozenset({"", "none", "default", "neutral"})
@@ -115,13 +120,52 @@ def active_personality_name(cfg: Optional[Dict[str, Any]]) -> str:
     return name if name and name in available_personalities(cfg) else ""
 
 
-def resolve_ephemeral_system_prompt(cfg: Optional[Dict[str, Any]]) -> str:
+def _system_prompt_file_blocks(cfg: Optional[Dict[str, Any]], base_dir: Optional[Path]) -> List[str]:
+    """Contents of ``agent.system_prompt_files`` in configured order; unreadable files are skipped."""
+    configured = _get(cfg, "agent", "system_prompt_files", default=None)
+    if isinstance(configured, str):
+        configured = [configured]
+    if not isinstance(configured, list):
+        return []
+    blocks: List[str] = []
+    for raw_path in configured:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        path = Path(os.path.expandvars(raw_path.strip())).expanduser()
+        if not path.is_absolute():
+            if base_dir is None:
+                from hermes_constants import get_hermes_home
+                base_dir = get_hermes_home()
+            path = base_dir / path
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            logger.warning("System prompt file not found: %s", path)
+            continue
+        except Exception as exc:
+            logger.warning("Failed to load system prompt file %s: %s", path, exc)
+            continue
+        if content:
+            blocks.append(content)
+    return blocks
+
+
+def resolve_ephemeral_system_prompt(cfg: Optional[Dict[str, Any]], *, base_dir: Optional[Path] = None) -> str:
     """Session overlay: ``display.personality`` when it names a known personality, else the
-    user-owned ``agent.system_prompt``. Callers still prefer ``HERMES_EPHEMERAL_SYSTEM_PROMPT``."""
+    user-owned ``agent.system_prompt``. Callers still prefer ``HERMES_EPHEMERAL_SYSTEM_PROMPT``.
+
+    ``agent.system_prompt_files`` are prepended in configured order. Relative paths resolve
+    against *base_dir* — the home whose config *cfg* came from (a multiplexed gateway passes the
+    serving profile's) — or the active Hermes home."""
     name = active_personality_name(cfg)
     if name:
-        return render_personality_prompt(available_personalities(cfg)[name])
-    return prompt_text(_get(cfg, "agent", "system_prompt", default=""))
+        prompt = render_personality_prompt(available_personalities(cfg)[name])
+    else:
+        prompt = prompt_text(_get(cfg, "agent", "system_prompt", default=""))
+    blocks = _system_prompt_file_blocks(cfg, base_dir)
+    if prompt:
+        blocks.append(prompt)
+    return "\n\n".join(blocks)
 
 
 def persist_personality(value: Any) -> bool:
