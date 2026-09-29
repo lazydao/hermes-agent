@@ -123,6 +123,18 @@ def bound_session_key() -> str:
     return "" if value is _UNSET else value
 
 
+@contextmanager
+def session_message_id_scope(message_id: str) -> Iterator[None]:
+    """Bind ``HERMES_SESSION_MESSAGE_ID`` (the reply anchor) for exactly one agent turn and restore
+    the enclosing value on exit, so a queued follow-up turn never runs under an earlier turn's
+    triggering message."""
+    token = _SESSION_MESSAGE_ID.set(message_id)
+    try:
+        yield
+    finally:
+        _SESSION_MESSAGE_ID.reset(token)
+
+
 def source_route_metadata(source: Any, metadata: dict | None) -> dict | None:
     """Keep inbound route anchors for durable deliveries after the source is gone."""
     anchors = {key: str(value) for key in ("scope_id", "parent_chat_id")
