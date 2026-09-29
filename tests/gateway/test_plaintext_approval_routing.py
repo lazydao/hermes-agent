@@ -93,7 +93,13 @@ def _register_blocking_approval(runner):
     return session_key, entry
 
 
-@pytest.mark.parametrize("reply", ["yes", "approve", "ok", "y", "confirm"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "yes", "approve", "ok", "y", "confirm",
+        "确定", "确认", "同意", "允许执行 record-correction --apply",
+    ],
+)
 def test_plaintext_yes_resolves_approval(reply):
     _clear_approval_state()
     runner, adapter = _make_runner()

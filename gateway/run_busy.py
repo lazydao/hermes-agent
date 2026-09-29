@@ -597,7 +597,13 @@ class GatewayBusySessionMixin:
 
     # Bare-word approval replies → (verb, args) for the synthesized slash command. English words
     # (and the thumbs) always match; ``approval.inputs.*`` adds the active language's synonyms.
-    _PLAINTEXT_APPROVAL_EXTRA_WORDS: dict[str, tuple] = {"👍": ("approve", ""), "👎": ("deny", "")}
+    # The fork's Chinese approvals apply in every language.
+    _PLAINTEXT_APPROVAL_EXTRA_WORDS: dict[str, tuple] = {
+        "👍": ("approve", ""), "👎": ("deny", ""),
+        **{w: ("approve", "") for w in ("确定", "确认", "同意", "允许", "批准", "允许执行")},
+    }
+    # Chinese approvals often echo the command: "允许执行 <command>" approves once.
+    _PLAINTEXT_APPROVAL_PREFIXES: tuple = ("允许执行 ", "同意执行 ", "批准执行 ")
     _PLAINTEXT_APPROVAL_INPUT_KEYS: tuple[tuple[str, tuple], ...] = (
         ("approve", ("approve", "")), ("deny", ("deny", "")),
         ("always", ("approve", "always")), ("session", ("approve", "session")))
@@ -635,6 +641,8 @@ class GatewayBusySessionMixin:
             if event.allow_gateway_control and has_blocking_approval(session_key):
                 _raw_text = (event.text or "").strip().lower()
                 _match = self._plaintext_approval_words().get(_raw_text)
+                if _match is None and _raw_text.startswith(self._PLAINTEXT_APPROVAL_PREFIXES):
+                    _match = ("approve", "")
                 if _match is not None:
                     _verb, _normalized_args = _match
                     _approval_handler = (
