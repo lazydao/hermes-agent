@@ -44,6 +44,9 @@ from hermes_cli.auth_device_flow import (
     _poll_device_token_generic, _poll_for_token, _print_device_code_instructions,
     _print_login_success, _print_loopback_ssh_hint, _prompt_yes_no, _request_device_code,
     _resolve_verify, _ssh_user_at_host)
+from hermes_cli.auth_pool_sharing import (  # noqa: F401  re-exported
+    credential_pool_is_globally_shared, credential_pool_store_lock, globally_shared_pool_providers,
+    shared_credential_pool_path)
 from hermes_cli.auth_oauth_grants import (
     SINGLE_USE_REFRESH_POOL_PROVIDERS, _oauth_heal_clean_marks, _oauth_heal_notices,
     consume_oauth_heal_notices, heal_forked_single_use_oauth_grants,
@@ -949,7 +952,9 @@ def read_credential_pool(provider_id: Optional[str] = None) -> dict[str, Any]:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode the global-root ``auth.json`` is a read-only fallback applied per provider ONLY
-    when the profile has zero entries for it (``hermes auth add`` in the profile shadows global)."""
+    when the profile has zero entries for it (``hermes auth add`` in the profile shadows global).
+    A provider opted into ``credential_pool_sharing.<id>: global`` reads the root rows only; the
+    profile's own rows for it are ignored (kept on disk, visible again once the opt-in is removed)."""
     pool = _load_auth_store().get("credential_pool")
     pool = pool if isinstance(pool, dict) else {}
     global_pool = _load_global_auth_store().get("credential_pool")
@@ -963,8 +968,18 @@ def read_credential_pool(provider_id: Optional[str] = None) -> dict[str, Any]:
                 continue
             if not (isinstance(existing, list) and existing):  # profile wins when it has ANY entries
                 merged[gp_key] = list(gp_entries)
+        if _global_auth_file_path() is not None:
+            for shared_key in globally_shared_pool_providers():
+                shared_entries = global_pool.get(shared_key)
+                if isinstance(shared_entries, list) and shared_entries:
+                    merged[shared_key] = list(shared_entries)
+                else:
+                    merged.pop(shared_key, None)
         return merged
 
+    if shared_credential_pool_path(provider_id) is not None:
+        shared_entries = global_pool.get(provider_id)
+        return list(shared_entries) if isinstance(shared_entries, list) else []
     provider_entries = pool.get(provider_id)
     if isinstance(provider_entries, list) and provider_entries:
         return list(provider_entries)
@@ -1105,11 +1120,13 @@ def write_credential_pool(
     so a rotation/exhaustion rewrite never drops a concurrent credential. Entries in
     *status_cleared_ids* were cleared deliberately (``hermes auth reset``) and skip the
     recency merge, which would otherwise read their cleared ``last_status_at`` (None ->
-    epoch 0) as a stale snapshot and copy a still-binding cooldown back."""
+    epoch 0) as a stale snapshot and copy a still-binding cooldown back. A provider opted into
+    the global pool (``shared_credential_pool_path``) is written to the root store, under its lock."""
     removed = {rid for rid in (removed_ids or ()) if rid}
     bases = token_bases or {}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    target_path = shared_credential_pool_path(provider_id)
+    with credential_pool_store_lock(provider_id):
+        auth_store = _load_auth_store(target_path)
         pool = _store_section(auth_store, "credential_pool")
         sanitized = [
             sanitize_borrowed_credential_payload(e, provider_id) if isinstance(e, dict) else e
@@ -1132,7 +1149,7 @@ def write_credential_pool(
             if disk_id and disk_id not in new_ids and disk_id not in removed:
                 merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        _save_auth_store(auth_store)
+        _save_auth_store(auth_store, target_path=target_path)
         return merged
 
 
