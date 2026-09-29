@@ -112,6 +112,14 @@ def _get_independent_completions() -> bool:
     completion messages that land as each finishes. Off = one consolidated message when the whole call is done."""
     return is_truthy_value(_cfg().get("independent_completions", False))
 
+def _get_continuation_reserve_iterations() -> int:
+    """delegation.continuation_reserve_iterations (default 0 = off): parent iterations a background dispatch keeps
+    out of reach of the rest of the foreground turn, for the completion turn that shares the request budget."""
+    return _knob(
+        "continuation_reserve_iterations", None, lambda v: max(0, int(v)), 0,
+        "delegation.continuation_reserve_iterations=%r is not a valid integer; disabling the reserve",
+    )
+
 def _get_worktree_isolation() -> bool:
     """delegation.worktree_isolation (bool, default False): each child gets its own
     git worktree off the parent's HEAD so parallel children never contend for one

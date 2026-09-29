@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 from agent.agent_runtime_helpers_placeholders import hidden_interrupt_placeholder_row
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
-from agent.iteration_budget import IterationBudget
+from agent.iteration_budget import IterationBudget, restore_foreground_iteration_cap
 from agent.message_metadata import append_message, without_persistence_fields
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
@@ -1823,6 +1823,8 @@ def run_conversation(
     agent._turn_user_intervened = False
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
+    # A foreground cap applied by an async dispatch this turn ends with the turn on EVERY exit
+    # (return, early return, exception), after finalize_turn has read it.
     with native_turn_images(user_message):
         try:
             result = _run_conversation_turn(
@@ -1845,6 +1847,7 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
+            restore_foreground_iteration_cap(agent)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))

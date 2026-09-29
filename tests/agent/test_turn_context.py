@@ -183,6 +183,7 @@ def test_ordinary_turn_gets_a_fresh_iteration_budget():
 
     assert agent.iteration_budget is not stale
     assert (agent.iteration_budget.max_total, agent.iteration_budget.used) == (90, 0)
+    assert agent._async_completion_uses_shared_budget is False
 
 
 def test_internal_continuation_adopts_the_request_chain_budget():
@@ -197,6 +198,45 @@ def test_internal_continuation_adopts_the_request_chain_budget():
 
     assert agent.iteration_budget is request_budget
     assert agent.iteration_budget.used == 3
+    assert agent._async_completion_uses_shared_budget is True
+
+
+def test_turn_start_drops_a_stale_foreground_cap():
+    from agent.iteration_budget import apply_foreground_iteration_cap
+
+    agent = _FakeAgent()
+    apply_foreground_iteration_cap(agent, 70)
+
+    _build(agent)
+
+    assert agent.max_iterations == 90
+    assert agent.iteration_budget.max_total == 90
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_run_conversation_always_restores_the_foreground_cap(monkeypatch, raises):
+    """An async dispatch's cap is for the rest of THAT turn only: restored on every exit."""
+    from agent import conversation_loop
+    from agent.iteration_budget import apply_foreground_iteration_cap
+
+    agent = _FakeAgent()
+
+    def fake_turn(agent_, *_a, **_kw):
+        apply_foreground_iteration_cap(agent_, 70)
+        if raises:
+            raise RuntimeError("turn blew up")
+        return {"final_response": "ok", "messages": []}
+
+    monkeypatch.setattr(conversation_loop, "_run_conversation_turn", fake_turn)
+    monkeypatch.setattr("agent.turn_context.export_current_turn_boundary", lambda _a, result, _m: result)
+    monkeypatch.setattr(conversation_loop, "_close_durable_failed_turn", lambda *_a: None)
+    if raises:
+        with pytest.raises(RuntimeError):
+            conversation_loop.run_conversation(agent, "hi")
+    else:
+        assert conversation_loop.run_conversation(agent, "hi")["final_response"] == "ok"
+    assert agent.max_iterations == 90
+    assert "_foreground_iteration_cap_original" not in agent.__dict__
 
 
 def test_returns_turn_context_with_user_message_appended():
