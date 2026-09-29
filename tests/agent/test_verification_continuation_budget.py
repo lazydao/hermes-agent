@@ -384,3 +384,32 @@ def test_pre_response_hook_failure_lets_response_through(agent, monkeypatch):
 
     assert result["final_response"] == "answer"
     assert result["completed"] is True
+
+
+def test_pre_response_replace_drops_provider_native_replay_of_withheld_text(agent):
+    """codex_message_items / *_content_blocks are replayed instead of ``content`` on later turns, so
+    a replaced answer must not keep them or the model sees the withheld text again next turn."""
+    from agent.turn_stop_gates import apply_pre_response_gate
+
+    final_msg = {
+        "role": "assistant", "content": "I changed the protected file.",
+        "codex_message_items": [{"type": "message", "content": [{"type": "output_text", "text": "I changed the protected file."}]}],
+        "anthropic_content_blocks": [{"type": "text", "text": "I changed the protected file."}],
+        "bedrock_content_blocks": [{"text": "I changed the protected file."}],
+        "codex_reasoning_items": [{"type": "reasoning", "encrypted_content": "opaque"}],
+    }
+    has_hook, directive, bound, invoke = _pre_response_patches(
+        {"action": "replace", "message": "I cannot confirm that change."},
+    )
+    with has_hook, directive, bound, invoke:
+        verdict = apply_pre_response_gate(
+            agent, final_msg, final_response=final_msg["content"], messages=[],
+            user_message="change it", pending_pre_response_fallback=None,
+        )
+
+    assert final_msg["content"] == "I cannot confirm that change."
+    for key in ("codex_message_items", "anthropic_content_blocks", "bedrock_content_blocks"):
+        assert key not in final_msg
+    assert final_msg["codex_reasoning_items"]  # opaque reasoning carries no answer text
+    assert verdict.continue_turn is False
+    assert verdict.final_response == "I cannot confirm that change."
