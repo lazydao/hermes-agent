@@ -191,6 +191,61 @@ async def test_agent_notify_receipt_only_while_launching_turn_is_busy(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("agent_notify", [True, False])
+@pytest.mark.parametrize("policy_field", ["suppress_background_process_errors", "suppress_warning_notifications"])
+@pytest.mark.parametrize("platform,exit_code", [
+    (Platform.FEISHU, 2), (Platform.FEISHU, 0), (Platform.TELEGRAM, 2),
+])
+async def test_busy_completion_obeys_owning_profile_diagnostic_policy(
+    monkeypatch, tmp_path, platform, exit_code, agent_notify, policy_field
+):
+    """Hide only automatic failures; keep the agent wake, normal replies and other profiles."""
+    import tools.process_registry as pr_module
+    from gateway.run import _async_profile_runtime_scope
+    from gateway.warning_notifications import warning_notifications_enabled
+    from agent.notification_presentation import diagnostic_process_event
+
+    homes = [tmp_path / "muted", tmp_path / "visible"]
+    for home, muted in zip(homes, (True, False)):
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "display:\n  background_process_notifications: concise\n"
+            "  platforms:\n    feishu:\n"
+            f"      {policy_field}: {str(muted).lower()}\n"
+        )
+    runner = _build_runner(monkeypatch, tmp_path, "concise")
+    adapter = runner.adapters.pop(Platform.TELEGRAM)
+    runner.adapters[platform] = adapter
+    runner._completion_event_scope = lambda watcher: _async_profile_runtime_scope(watcher["test_home"])
+    runner._launching_turn_active = AsyncMock(return_value=True)
+    runner._enqueue_process_completion_notification = AsyncMock(return_value=True)
+    watcher = {**_watcher_dict(), "platform": platform.value, "notify_on_complete": agent_notify,
+               "session_key": f"agent:main:{platform.value}:group:123"}
+
+    # Read real profile YAML in A -> B -> A order; the default home remains unmuted.
+    for home in (homes[0], homes[1], homes[0]):
+        adapter.send.reset_mock()
+        runner._enqueue_process_completion_notification.reset_mock()
+        session = SimpleNamespace(output_buffer="tool failed\n", exited=True,
+                                  exit_code=exit_code, command="check", started_at=None)
+        monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry([session]))
+        watcher["test_home"] = home
+        await runner._run_process_watcher(watcher)
+        if agent_notify:
+            wake = runner._enqueue_process_completion_notification.await_args.args[1]
+            assert wake["exit_code"] == exit_code and "tool failed" in wake["output"]
+            assert not diagnostic_process_event(wake)
+        else:
+            runner._enqueue_process_completion_notification.assert_not_awaited()
+        hidden = home == homes[0] and platform == Platform.FEISHU and exit_code != 0
+        assert adapter.send.await_count == int(not hidden)
+        async with _async_profile_runtime_scope(home):
+            general_muted = (policy_field == "suppress_warning_notifications"
+                             and home == homes[0] and platform == Platform.FEISHU)
+            assert warning_notifications_enabled(platform) == (not general_muted)
+
+
+@pytest.mark.asyncio
 async def test_arm_process_watcher_schedules_on_live_loop_only(monkeypatch, tmp_path):
     """#112033: a watcher registered mid-turn starts on the gateway loop at once while the gateway
     serves; before/after that the caller keeps it for the startup / post-turn drain."""

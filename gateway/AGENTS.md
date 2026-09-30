@@ -71,6 +71,10 @@ while it stops, drained at startup and post-turn. Agent-notify watchers send no 
 receipt (the agent's next turn is the report) unless the launching turn is still running at exit
 — then the injection only queues a follow-up, so the concise receipt goes out immediately.
 
+`display.platforms.<platform>.suppress_background_process_errors: true` hides automatic
+non-zero-exit process receipts only. Completion events still wake the agent; success receipts,
+normal replies and cron failure diagnostics retain their own policies.
+
 The idle completion watcher also drains `watch_match` / `watch_disabled`; no user follow-up is
 required. Notify-off drains these without waking. Transport failures are retried; unavailable
 durable completion owners/transports do not spend delivery attempts. Profile-namespaced process
