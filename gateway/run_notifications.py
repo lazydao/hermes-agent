@@ -1682,8 +1682,16 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         adapter = self._resolve_injection_adapter(platform_name, source)
         return session_key in (getattr(adapter, "_active_sessions", None) or {})
 
-    async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> None:
+    async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict,
+                                    *, failed: bool = False) -> None:
         from gateway.run import _non_conversational_metadata
+        if failed:
+            from gateway.display_config import resolve_display_setting
+            from gateway.warning_notifications import effective_user_config
+            async with self._completion_event_scope(watcher):
+                if resolve_display_setting(effective_user_config(), platform_name,
+                                           "suppress_background_process_errors", False):
+                    return
         source = await asyncio.to_thread(self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
         if adapter and chat_id:
@@ -1843,7 +1851,12 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                             notify_mode == "error" and session.exit_code not in {0, None}
                         )):
                             message_text = self._format_process_final_message(session_id, session, "concise")
-                            await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
+                            from gateway.warning_notifications import present_notification
+                            async with self._completion_event_scope(watcher):
+                                await present_notification(
+                                    lambda: self._send_watcher_message(platform_name, chat_id, thread_id, message_text,
+                                                                       watcher, failed=session.exit_code not in {0, None}),
+                                    platform=platform_name, diagnostic=session.exit_code not in {0, None})
                         break
                     # A refusal may clear (adapter reconnecting, store draining), so retry with backoff
                     # for a few minutes, then fall through to the plain notice instead of dropping it.
@@ -1887,7 +1900,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     async with self._completion_event_scope(watcher):
                         # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
                         await present_notification(
-                            lambda: self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher),
+                            lambda: self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher,
+                                                               failed=session.exit_code not in {0, None}),
                             platform=platform_name, diagnostic=session.exit_code not in {0, None})
                 break
             elif has_new_output and notify_mode == "all" and not agent_notify:
