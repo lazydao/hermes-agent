@@ -247,7 +247,7 @@ class TestResolveApproval:
         mock_resolve.assert_called_once_with("sess-6", "once")
 
     @pytest.mark.asyncio
-    async def test_group_open_rule_does_not_bypass_operator_allowlist(self):
+    async def test_group_open_rule_lets_any_member_answer(self):
         adapter = _make_adapter()
         adapter._allowed_group_users = {"ou_owner"}
         adapter._group_rules["oc_open"] = feishu_module.FeishuGroupRule(policy="open", require_mention=True)
@@ -256,8 +256,62 @@ class TestResolveApproval:
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._resolve_approval(7, "session", "Group Member", open_id="ou_member", chat_id="oc_open")
 
+        mock_resolve.assert_called_once_with("sess-7", "session")
+        assert 7 not in adapter._approval_state
+
+    @pytest.mark.asyncio
+    async def test_open_rule_of_another_chat_does_not_authorize(self):
+        """The rule is judged for the chat the prompt was posted to, not a chat the click claims."""
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"ou_owner"}
+        adapter._group_rules["oc_open"] = feishu_module.FeishuGroupRule(policy="open", require_mention=True)
+        adapter._approval_state[8] = {"session_key": "sess-8", "message_id": "msg_008", "chat_id": "oc_private"}
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            await adapter._resolve_approval(8, "once", "Group Member", open_id="ou_member", chat_id="oc_open")
+
         mock_resolve.assert_not_called()
-        assert 7 in adapter._approval_state
+        assert 8 in adapter._approval_state
+
+
+class TestInteractiveOperatorAuthorization:
+    """Exact group_rules entries widen who may answer a prompt in that chat; they never narrow it."""
+
+    @staticmethod
+    def _adapter_with_rules():
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"ou_owner"}
+        rule = feishu_module.FeishuGroupRule
+        adapter._group_rules.update({
+            "oc_open": rule(policy="open", require_mention=True),
+            "oc_allow": rule(policy="allowlist", require_mention=True, allowlist={"ou_listed"}),
+            "oc_block": rule(policy="blacklist", require_mention=True, blacklist={"ou_banned"}),
+            "oc_off": rule(policy="disabled", require_mention=True),
+        })
+        return adapter
+
+    @pytest.mark.parametrize("chat_id, operator, expected", [
+        ("oc_open", "ou_member", True),
+        ("oc_allow", "ou_listed", True),
+        ("oc_allow", "ou_member", False),
+        ("oc_block", "ou_member", True),
+        ("oc_block", "ou_banned", False),
+        ("oc_off", "ou_member", False),
+        ("oc_unruled", "ou_member", False),
+        ("", "ou_member", False),
+    ])
+    def test_group_rule_matrix(self, chat_id, operator, expected):
+        adapter = self._adapter_with_rules()
+        assert adapter._is_interactive_operator_authorized(operator, chat_id=chat_id) is expected
+
+    @pytest.mark.parametrize("chat_id", ["oc_open", "oc_allow", "oc_block", "oc_off", "oc_unruled", ""])
+    def test_allowlisted_operator_is_never_narrowed_by_a_rule(self, chat_id):
+        adapter = self._adapter_with_rules()
+        assert adapter._is_interactive_operator_authorized("ou_owner", chat_id=chat_id) is True
+
+    def test_empty_operator_is_rejected_even_in_an_open_chat(self):
+        adapter = self._adapter_with_rules()
+        assert adapter._is_interactive_operator_authorized("", chat_id="oc_open") is False
 
 
 # ===========================================================================

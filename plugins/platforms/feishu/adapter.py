@@ -2224,13 +2224,19 @@ class FeishuAdapter(BasePlatformAdapter):
         future.add_done_callback(self._log_background_failure)
         return True
 
-    def _is_interactive_operator_authorized(self, open_id: str, *, user_id: str = "") -> bool:
-        """Return whether this card-action operator may answer gated prompts. ``user_id`` (the
-        operator's tenant id, approval cards only) matches allowlists written with user_ids; group
-        admission rules never broaden this list."""
+    def _is_interactive_operator_authorized(self, open_id: str, *, user_id: str = "", chat_id: str = "") -> bool:
+        """Return whether this card-action operator may answer gated prompts: anyone an exact
+        ``group_rules`` entry admits in the prompt's chat (``open`` = every member), plus admins /
+        the allowlist everywhere. Group rules only widen the operator set, never narrow it.
+        ``user_id`` (the operator's tenant id, approval cards only) matches lists written with user_ids."""
         normalized = str(open_id or "").strip()
         if not normalized:
             return False
+        normalized_chat_id = str(chat_id or "").strip()
+        if normalized_chat_id and normalized_chat_id in self._group_rules:
+            sender_id = SimpleNamespace(open_id=normalized, user_id=str(user_id or "").strip() or None)
+            if self._allow_group_message(sender_id, normalized_chat_id):
+                return True
         allowed_ids = set(self._admins) | set(self._allowed_group_users)
         if not allowed_ids:
             return True
@@ -2259,11 +2265,12 @@ class FeishuAdapter(BasePlatformAdapter):
         """
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        if not self._is_interactive_operator_authorized(open_id, user_id=user_id):
-            logger.warning("[Feishu] Unauthorized %s click by %s", label, open_id or "<unknown>")
-            return None
         callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
         expected_chat_id = str(state.get("chat_id", "") or "")
+        # Judge group rules by the chat the prompt was posted to, not the callback's claim.
+        if not self._is_interactive_operator_authorized(open_id, user_id=user_id, chat_id=expected_chat_id):
+            logger.warning("[Feishu] Unauthorized %s click by %s", label, open_id or "<unknown>")
+            return None
         if callback_chat_id and expected_chat_id and callback_chat_id != expected_chat_id:
             logger.warning(
                 "[Feishu] %s callback chat mismatch for %s (expected=%s, got=%s)",
@@ -2329,10 +2336,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] %s %s already resolved or unknown", label, ident)
             return None
-        if not self._is_interactive_operator_authorized(open_id, user_id=user_id):
+        expected_chat_id = str(state.get("chat_id", "") or "")
+        if not self._is_interactive_operator_authorized(open_id, user_id=user_id, chat_id=expected_chat_id):
             logger.warning(unauthorized_fmt, operator_repr, ident)
             return None
-        expected_chat_id = str(state.get("chat_id", "") or "")
         if expected_chat_id and chat_id and expected_chat_id != chat_id:
             logger.warning("[Feishu] %s %s chat mismatch (expected=%s, got=%s)", label, ident, expected_chat_id, chat_id)
             return None

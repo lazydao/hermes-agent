@@ -304,6 +304,8 @@ Card action events are dispatched with `MessageType.COMMAND`, so they flow throu
 
 This is also how **command approval** works — when the agent needs to run a dangerous command, it sends an interactive card with Allow Once / Session / Always / Deny buttons. The user clicks a button, and the card action callback delivers the approval decision back to the agent.
 
+Who may click: admins and `FEISHU_ALLOWED_USERS` everywhere, plus — in a chat with an exact `group_rules.<chat_id>` entry — anyone that rule admits (`policy: open` lets every member of that group answer its prompts). A rule only widens the set for its own chat; it never removes allowlisted operators.
+
 ### Required Feishu App Configuration
 
 Interactive cards need the following configuration in the Feishu Developer Console. The usual symptom of a gap here is error **200340** when users click card buttons.
