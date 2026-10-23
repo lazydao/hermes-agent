@@ -69,10 +69,6 @@ Canonical local CLI/TUI/Desktop sessions admit completion and watch events into 
 FIFO as human input (private launch policy, `internal_notification` display kind); observers never
 own or consume those turns, and an interrupted started turn stays unknown and pauses its followers.
 
-`display.platforms.<platform>.suppress_background_process_errors: true` hides automatic
-non-zero-exit process receipts only. Completion events still wake the agent; success receipts,
-normal replies and cron failure diagnostics retain their own policies.
-
 ## `/login` (off-turn, paired DM only)
 
 `GatewayLoginCommandsMixin` refuses outside a real paired DM (ntfy, raft and a2a report `dm` for

@@ -145,8 +145,7 @@ Every former god file is a **facade** (public entry points + the names other pac
   `@pytest.mark.platforms(...)`, never by faking `sys.platform`; tests never write to `~/.hermes/`.
   Everything else: `tests/AGENTS.md`.
 
-**Fork (`lazydao/hermes-agent`):** read `FORK_POLICIES.md` before core edits, gateway restarts,
-commits/pushes or upstream syncs.
+**Fork:** read `FORK_POLICIES.md` first.
 
 ## Routing Table — working in X → read X/AGENTS.md
 

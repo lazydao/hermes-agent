@@ -709,6 +709,10 @@ acceptance. Refused admission refunds every claimed batch sibling without spendi
 actual delivery errors keep their bounded retry policy. Recognized raw API routes resolve after
 persisted messaging origins and defer quietly when unavailable; malformed routes still warn.
 
+`display.platforms.<platform>.suppress_background_process_errors: true` hides automatic
+non-zero-exit process receipts only. Completion events still wake the agent; success receipts,
+normal replies and cron failure diagnostics retain their own policies.
+
 Cron execution has its own session. Eligible continuable deliveries may mirror or seed the
 reply-facing conversation: origin, origin-less home fallback, user-written bare-platform home,
 or opted-in explicit targets. `all` expansions do not gain home mirror eligibility. Mirrored
