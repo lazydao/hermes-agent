@@ -107,7 +107,7 @@ def test_drive_comment_agent_turn_binds_the_unscoped_launch_profile(tmp_path):
             reset_secret_scope(secret_token)
             reset_hermes_home_override(home_token)
 
-    def _fake_agent(prompt, client, session_key=""):
+    def _fake_agent(prompt, client, session_key="", user_id=""):
         seen["turn"] = _observe(launch_home)
         return "NO_REPLY"
 
@@ -147,7 +147,7 @@ def test_drive_comment_on_the_launch_adapter_reads_the_launch_env_through_the_re
     monkeypatch.setenv("HERMES_HOME", str(launch_home))
     seen = {}
 
-    def _fake_agent(prompt, client, session_key=""):
+    def _fake_agent(prompt, client, session_key="", user_id=""):
         seen["turn"] = _observe(launch_home)
         return "NO_REPLY"
 
