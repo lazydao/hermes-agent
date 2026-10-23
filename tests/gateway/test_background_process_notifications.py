@@ -1052,6 +1052,76 @@ async def test_drain_drops_completion_the_turn_already_polled(monkeypatch, tmp_p
     assert len(calls) == expected_turns
 
 
+@pytest.mark.parametrize("result, message_id, suppressed", [
+    (_OK, "m-2", True),                                   # wait()/log consumed: any triggering message
+    ({**_OK, "failed": True}, "m-1", False),              # the turn did not report it
+    ({**_OK, "final_response": ""}, "m-1", False),
+])
+def test_completion_consumed_by_wait_is_suppressed(monkeypatch, result, message_id, suppressed):
+    import tools.process_registry as pr_module
+    from gateway.run import _should_suppress_same_turn_polled_process_completion
+
+    registry = pr_module.ProcessRegistry()
+    registry._completion_consumed.add("proc_polled")
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    event = _completion_event(message_id=message_id, anchored=False)
+    assert _should_suppress_same_turn_polled_process_completion(result, event, "m-1") is suppressed
+
+
+@pytest.mark.asyncio
+async def test_drain_drops_every_queued_completion_the_turn_already_took(monkeypatch, tmp_path):
+    import importlib
+    import sys
+    import types
+
+    import tools.process_registry as pr_module
+    from gateway.session import SessionSource
+    from tests.gateway.test_run_progress_topics import ProgressCaptureAdapter, _make_runner
+
+    calls = []
+
+    class _Agent:
+        def __init__(self, **kwargs):
+            self.tools = []
+
+        def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+            calls.append(message)
+            return {"final_response": "both builds passed", "messages": [], "api_calls": 1, "completed": True}
+
+    registry = pr_module.ProcessRegistry()
+    registry._poll_observed.add("proc_polled")
+    registry._completion_consumed.add("proc_waited")
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _Agent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group", message_id="m-1")
+    session_key = "agent:main:telegram:group:-1001"
+    first, second = _completion_event(), _completion_event(process_id="proc_waited", anchored=False)
+    first.source = second.source = source
+    adapter._pending_messages[session_key] = first
+    overflow = [second]
+    monkeypatch.setattr(runner, "_overflow_queue", lambda key: overflow)
+
+    await runner._run_agent(
+        message="build both", context_prompt="", history=[], source=source, session_id="sess-two",
+        session_key=session_key,
+    )
+
+    assert calls == ["build both"]
+    assert overflow == []
+
+
 @pytest.mark.asyncio
 async def test_coalesced_completion_batch_is_never_deduped_as_one_process(monkeypatch, tmp_path):
     runner = _build_runner(monkeypatch, tmp_path, "all")

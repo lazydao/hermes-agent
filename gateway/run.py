@@ -2640,9 +2640,10 @@ def _should_suppress_same_turn_polled_process_completion(
     result: Any, pending_event: MessageEvent | None, current_message_id: Any,
 ) -> bool:
     """Drop a queued completion turn the finishing turn already covered: the internal event reports
-    ONE background process started from the same triggering message, and this turn succeeded with
-    a visible answer after observing that process's exit via ``poll()``. ``poll()`` stays read-only
-    for every other case (another message, a failed/empty turn, a coalesced batch)."""
+    ONE background process, this turn succeeded with a visible answer, and either the agent already
+    took the full result via ``wait()``/log (the watcher raced it), or the process was started from
+    the same triggering message and this turn observed its exit via ``poll()``. ``poll()`` stays
+    read-only for every other case (another message, a failed/empty turn, a coalesced batch)."""
     if (
         pending_event is None or not bool(getattr(pending_event, "internal", False))
         or not _should_clear_resume_pending_after_turn(result or {})
@@ -2652,13 +2653,17 @@ def _should_suppress_same_turn_polled_process_completion(
     from gateway.run_notifications import BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY
     metadata = getattr(pending_event, "metadata", None)
     process_id = str((metadata or {}).get(BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY) or "").strip()
+    if not process_id:
+        return False
+    from tools.process_registry import process_registry
+    if process_registry.is_completion_consumed(process_id):
+        return True
     # Synthetic completions carry no reply anchor; the triggering message id rides metadata.
     origin_message_id = str(
         (metadata or {}).get("original_trigger_message_id") or getattr(pending_event, "message_id", None) or ""
     ).strip()
-    if not process_id or not origin_message_id or origin_message_id != str(current_message_id or "").strip():
+    if not origin_message_id or origin_message_id != str(current_message_id or "").strip():
         return False
-    from tools.process_registry import process_registry
     return process_registry.was_completion_polled(process_id)
 
 
