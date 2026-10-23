@@ -951,9 +951,17 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             from gateway.session_authorities import active_authority
             authority = active_authority(self)
             if authority is not None:
-                from gateway.session_automation import admit_process_notice
+                from gateway.run import remember_admitted_request_chain_budget
+                from gateway.session_automation import admit_process_notice, producer_identity
                 from hermes_state_runtime import RuntimeStoreError
+                # Durable admission accepts only its own metadata. The drain's process id is the
+                # admission identity itself (``withdraw_covered_completions``); the runtime budget
+                # waits in a process-local table for the restored event.
+                budget = synth_event.metadata.pop(REQUEST_CHAIN_BUDGET_EVENT_KEY, None)
+                synth_event.metadata.pop(BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY, None)
                 try:
+                    if budget is not None:
+                        remember_admitted_request_chain_budget(producer_identity(self, evt), budget)
                     await admit_process_notice(self, authority, adapter, synth_event, evt)
                 except RuntimeStoreError as exc:
                     raise WakeNotAccepted(str(exc), reason=exc.reason) from exc

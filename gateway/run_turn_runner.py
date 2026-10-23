@@ -1238,7 +1238,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         if room is not None:
             max_iterations = room.max_iterations
             ctx.enabled_toolsets = list(room.enabled_toolsets)
-        if ctx.request_chain_budget is None:
+        if getattr(ctx, "request_chain_budget", None) is None:
             # A user turn opens a request chain; its internal continuations reuse this budget.
             from agent.iteration_budget import IterationBudget
             ctx.request_chain_budget = IterationBudget(max_iterations)

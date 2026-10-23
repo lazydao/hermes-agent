@@ -24,6 +24,7 @@ import signal
 import threading
 import time
 import traceback
+import weakref
 from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
@@ -2609,14 +2610,30 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     return adapter.get_pending_message(session_key)
 
 
+# Durable admission persists no runtime objects: a wake admitted through the session authority
+# leaves its originating request's IterationBudget here, keyed by the admission identity the
+# restored event carries as ``message_id``. Weak: a budget nothing else holds any more (its
+# process or delegation is gone) falls back to a fresh request, as after a restart.
+_admitted_request_chain_budgets: "weakref.WeakValueDictionary[str, Any]" = weakref.WeakValueDictionary()
+
+
+def remember_admitted_request_chain_budget(identity: str, budget: Any) -> None:
+    from agent.iteration_budget import IterationBudget
+    if identity and isinstance(budget, IterationBudget):
+        _admitted_request_chain_budgets[identity] = budget
+
+
 def _request_chain_budget_from_event(event: MessageEvent | None) -> Any:
     """The originating request's ``IterationBudget`` carried by an INTERNAL event, else ``None``.
-    External events never carry one (the key is runtime-only and type-checked here)."""
+    External events never carry one (the key is runtime-only and type-checked here); an event
+    restored from a durable admission finds it by its identity."""
     from agent.iteration_budget import REQUEST_CHAIN_BUDGET_EVENT_KEY, IterationBudget
     if event is None or not bool(getattr(event, "internal", False)):
         return None
     metadata = getattr(event, "metadata", None)
     budget = metadata.get(REQUEST_CHAIN_BUDGET_EVENT_KEY) if isinstance(metadata, dict) else None
+    if budget is None and getattr(event, "message_id", None):
+        budget = _admitted_request_chain_budgets.get(str(event.message_id))
     return budget if isinstance(budget, IterationBudget) else None
 
 
@@ -2644,24 +2661,32 @@ def _should_suppress_same_turn_polled_process_completion(
     took the full result via ``wait()``/log (the watcher raced it), or the process was started from
     the same triggering message and this turn observed its exit via ``poll()``. ``poll()`` stays
     read-only for every other case (another message, a failed/empty turn, a coalesced batch)."""
-    if (
-        pending_event is None or not bool(getattr(pending_event, "internal", False))
-        or not _should_clear_resume_pending_after_turn(result or {})
-        or not str((result or {}).get("final_response") or "").strip()
-    ):
+    if pending_event is None or not bool(getattr(pending_event, "internal", False)):
         return False
     from gateway.run_notifications import BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY
     metadata = getattr(pending_event, "metadata", None)
     process_id = str((metadata or {}).get(BACKGROUND_PROCESS_COMPLETION_SESSION_ID_KEY) or "").strip()
-    if not process_id:
-        return False
-    from tools.process_registry import process_registry
-    if process_registry.is_completion_consumed(process_id):
-        return True
     # Synthetic completions carry no reply anchor; the triggering message id rides metadata.
     origin_message_id = str(
         (metadata or {}).get("original_trigger_message_id") or getattr(pending_event, "message_id", None) or ""
     ).strip()
+    return _turn_covered_process_completion(result, process_id, origin_message_id, current_message_id)
+
+
+def _turn_covered_process_completion(result: Any, process_id: str, origin_message_id: str,
+                                     current_message_id: Any) -> bool:
+    """The rule behind :func:`_should_suppress_same_turn_polled_process_completion`, shared with the
+    durable sweep (``session_automation.withdraw_covered_completions``): this turn succeeded with
+    a visible answer, and the agent took process ``process_id``'s full result via ``wait()``/log, or
+    polled it to exit from the turn of the message that started it."""
+    if (
+        not process_id or not _should_clear_resume_pending_after_turn(result or {})
+        or not str((result or {}).get("final_response") or "").strip()
+    ):
+        return False
+    from tools.process_registry import process_registry
+    if process_registry.is_completion_consumed(process_id):
+        return True
     if not origin_message_id or origin_message_id != str(current_message_id or "").strip():
         return False
     return process_registry.was_completion_polled(process_id)

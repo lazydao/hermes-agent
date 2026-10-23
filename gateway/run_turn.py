@@ -1718,6 +1718,10 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             if result.get("compression_exhausted") and pending_event is not None:
                 self._defer_past_exhaustion_reset(result, adapter, source, session_key, pending_event)
                 return None, None
+            if executing_admission.get():
+                # The authority's FIFO holds this route's queued wakes, not the adapter slot.
+                from gateway.session_automation import withdraw_covered_completions
+                await withdraw_covered_completions(self, session_key, result, getattr(source, "message_id", None))
             # Several processes can finish during one turn: every queued completion gets the check.
             while _should_suppress_same_turn_polled_process_completion(
                 result, pending_event, getattr(source, "message_id", None),

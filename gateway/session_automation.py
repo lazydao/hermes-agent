@@ -186,6 +186,40 @@ async def withdraw_process_ticks(runner, event):
                        event.get('session_id'), exc_info=True)
 
 
+async def withdraw_covered_completions(runner, session_key, result, current_message_id):
+    """The durable form of the drain's same-turn completion drop: cancel the route's queued
+    single-process completions whose result the finishing turn already took (``wait()``/log, or a
+    ``poll()`` to exit from the turn of the message that started the process). The process is the
+    admission identity itself; a coalesced batch (several identities) always gets its turn. Never
+    raises: a row left queued only costs the redundant turn the fork drops."""
+    import asyncio
+    from gateway.run import _turn_covered_process_completion
+    from gateway.session_authorities import active_authority
+    try:
+        authority = active_authority(runner)
+        entry = runner.session_store.lookup_by_session_key(str(session_key or '')) if authority else None
+        if entry is None:
+            return
+        from tools.process_registry import process_registry
+        pending = await asyncio.to_thread(
+            list_session_admissions, authority.db, session_id=_route_owner(authority, entry))
+        for row in pending:
+            if row['status'] != 'queued' or row['principal_id'] != 'automation:' + entry.session_key:
+                continue
+            descriptor = row['payload'].get('local_automation_v1') or row['payload'].get('native_text_v1', {}).get('automation', {})
+            identity = _identities([row['request_id']])
+            if len(descriptor.get('identities') or ()) > 1 or not identity or identity[0][0] != 'completion':
+                continue
+            process_id = str(identity[0][1] if len(identity[0]) > 1 else '')
+            process = await asyncio.to_thread(process_registry.get, process_id) if process_id else None
+            origin = str(getattr(process, 'watcher_message_id', '') or '')
+            if (_turn_covered_process_completion(result, process_id, origin, current_message_id)
+                    and await _withdraw(authority, row)):
+                logger.info("Withdrew queued completion turn for %s: this turn already took its result", process_id)
+    except Exception:
+        logger.warning("Could not withdraw the covered completions of %s", session_key, exc_info=True)
+
+
 def _heartbeat_lock(runner):
     # A tick's check-and-admit and a completion's admit-and-withdraw: interleaved, a tick checked
     # before the completion landed is admitted after its withdrawal and runs as a stale turn.
