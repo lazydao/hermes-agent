@@ -488,7 +488,7 @@ def _save_session_history(key: str, messages: list[dict[str, Any]]) -> None:
         logger.info("[Feishu-Comment] Session saved: %s (%d messages)", key, len(cleaned))
 
 
-def _resolve_comment_agent_toolsets() -> Tuple[List[str], Optional[List[str]]]:
+def _resolve_comment_agent_toolsets() -> tuple[list[str], Optional[list[str]]]:
     """``(enabled, disabled)`` toolsets a normal Feishu turn gets, from the serving profile's config
     (``platform_toolsets.feishu`` / ``agent.disabled_toolsets``). The doc/drive toolsets this flow
     exists for are always enabled unless explicitly disabled."""

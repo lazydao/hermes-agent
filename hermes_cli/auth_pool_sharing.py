@@ -17,7 +17,7 @@ from typing import FrozenSet, Optional
 from hermes_cli.auth_constants import AUTH_LOCK_TIMEOUT_SECONDS
 
 
-def globally_shared_pool_providers() -> FrozenSet[str]:
+def globally_shared_pool_providers() -> frozenset[str]:
     """Providers the ACTIVE profile's config.yaml opts into the global pool."""
     try:
         from hermes_cli.config import read_raw_config_readonly

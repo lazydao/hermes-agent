@@ -44,7 +44,7 @@ from hermes_cli.auth_device_flow import (
     _poll_device_token_generic, _poll_for_token, _print_device_code_instructions,
     _print_login_success, _print_loopback_ssh_hint, _prompt_yes_no, _request_device_code,
     _resolve_verify, _ssh_user_at_host)
-from hermes_cli.auth_pool_sharing import (  # noqa: F401  re-exported
+from hermes_cli.auth_pool_sharing import (
     credential_pool_is_globally_shared, credential_pool_store_lock, globally_shared_pool_providers,
     shared_credential_pool_path)
 from hermes_cli.auth_oauth_grants import (

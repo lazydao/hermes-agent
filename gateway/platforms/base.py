@@ -418,7 +418,7 @@ def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = Non
 
 
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
 
@@ -1858,7 +1858,7 @@ class _ClarifyReactionTurn:
     """Reaction ownership follows one processing invocation, even across reset."""
 
     original_message_id: Optional[str]
-    events: Dict[str, MessageEvent] = field(default_factory=dict)
+    events: dict[str, MessageEvent] = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     outcome: Optional[ProcessingOutcome] = None
 
@@ -1979,7 +1979,7 @@ class BasePlatformAdapter(ABC):
         # Chats whose typing indicator is paused (approval waits); _keep_typing skips them.
         self._typing_paused: set = set()
         # Clarify answers whose processing reaction the owning turn clears (link_clarify_reactions).
-        self._clarify_reaction_turns: Dict[str, _ClarifyReactionTurn] = {}
+        self._clarify_reaction_turns: dict[str, _ClarifyReactionTurn] = {}
         # Per-chat status phrase; the regular _keep_typing refresh renders it (no extra API calls).
         self._status_text: dict[str, str] = {}
 

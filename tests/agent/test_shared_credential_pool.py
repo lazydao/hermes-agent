@@ -361,7 +361,7 @@ def test_codex_quota_probe_refresh_persists_to_shared_root(tmp_path, monkeypatch
         "openai-codex": [{"id": "account-a", "auth_type": "oauth", "access_token": "stale-local"}],
     }}))
     local_before = (profile / "auth.json").read_bytes()
-    import hermes_cli.auth_codex as auth_codex
+    from hermes_cli import auth_codex
 
     fresh = {"access_token": _jwt(int(time.time()) + 3600, "fresh"), "refresh_token": "refresh-new"}
     monkeypatch.setattr(auth_codex, "refresh_codex_oauth_pure", lambda *_args: dict(fresh))
@@ -375,7 +375,7 @@ def test_codex_quota_probe_refresh_persists_to_shared_root(tmp_path, monkeypatch
 
 
 def test_profile_preference_does_not_reorder_shared_pool(tmp_path, monkeypatch):
-    root, profile = _setup_shared_profile(
+    root, _profile = _setup_shared_profile(
         tmp_path, monkeypatch,
         [_api_key_entry("account-a", 0), _api_key_entry("account-b", 1)],
     )

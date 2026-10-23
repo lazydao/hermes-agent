@@ -1197,7 +1197,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         process hydrated at load time and adopt everything else from disk.
         """
         live = {entry.id: entry for entry in self._entries}
-        entries: List[PooledCredential] = []
+        entries: list[PooledCredential] = []
         raw_entries = read_credential_pool(self.provider)
         # The reloaded rows are the new persisted generation; later merges diff against them.
         self._persisted_token_pairs = auth_mod._token_pairs_by_id(raw_entries)

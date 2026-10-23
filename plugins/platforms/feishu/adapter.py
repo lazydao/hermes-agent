@@ -1717,8 +1717,8 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     async def _recover_stale_thread_send(
-        self, *, chat_id: str, chunk: str, msg_type: str, payload: str, metadata: Dict[str, Any],
-    ) -> tuple[Any, Optional[str], Optional[Dict[str, Any]]]:
+        self, *, chat_id: str, chunk: str, msg_type: str, payload: str, metadata: dict[str, Any],
+    ) -> tuple[Any, Optional[str], Optional[dict[str, Any]]]:
         """Recover a ``thread_id`` create rejected as stale (99992402): reply to the thread's latest
         message to stay in the topic, else send once to the chat with a notice. Returns the response
         and the ``(reply_to, metadata)`` route later chunks of the same reply should use."""
