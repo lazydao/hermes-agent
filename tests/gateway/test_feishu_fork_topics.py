@@ -280,3 +280,62 @@ async def test_non_stale_topic_error_does_not_fallback(monkeypatch):
     assert result.success is False
     assert len(calls) == 1
     fetch_last.assert_not_awaited()
+
+
+def _refusing_list_client(created_message_id: str = ""):
+    """Client whose thread list API is refused (no im:message.group_msg scope) and whose create
+    returns ``created_message_id``."""
+    list_calls = []
+
+    def fake_list(request):
+        list_calls.append(request)
+        return SimpleNamespace(success=lambda: False, code=230027, msg="need scope: im:message.group_msg", data=None)
+
+    def fake_create(request):
+        return _feishu_response(True, message_id=created_message_id)
+
+    client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(
+        message=SimpleNamespace(list=fake_list, create=fake_create))))
+    return client, list_calls
+
+
+@pytest.mark.asyncio
+async def test_stale_topic_reuses_known_topic_message_when_list_api_is_refused(monkeypatch):
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client, list_calls = _refusing_list_client()
+    adapter._remember_thread_anchor("omt_topic", "om_inbound")
+    calls = []
+    responses = iter([_feishu_response(False, code=99992402), _feishu_response(True, message_id="om_reply")])
+
+    async def fake_send(**kwargs):
+        calls.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(adapter, "_feishu_send_with_retry", fake_send)
+
+    result = await adapter.send(chat_id="oc_chat", content="done", metadata={"thread_id": "omt_topic"})
+
+    assert result.success is True
+    assert calls[1]["reply_to"] == "om_inbound"
+    assert calls[1]["metadata"]["thread_id"] == "omt_topic"
+    assert len(calls) == 2  # no forward to the chat
+    assert list_calls == []
+
+
+@pytest.mark.asyncio
+async def test_topic_send_records_its_message_as_the_topic_anchor(monkeypatch):
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client, list_calls = _refusing_list_client(created_message_id="om_sent")
+
+    async def run_blocking(fn, *args):
+        return fn(*args)
+
+    monkeypatch.setattr(adapter, "_run_blocking", run_blocking)
+    monkeypatch.setattr(adapter, "_build_create_message_body", lambda **kwargs: kwargs)
+    monkeypatch.setattr(adapter, "_build_create_message_request", lambda receive_id_type, body: body)
+
+    await adapter._send_raw_message(chat_id="oc_chat", msg_type="text", payload="{}", reply_to=None,
+                                    metadata={"thread_id": "omt_topic"})
+
+    assert await adapter._fetch_last_message_in_thread("omt_topic") == "om_sent"
+    assert list_calls == []

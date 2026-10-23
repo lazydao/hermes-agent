@@ -190,6 +190,7 @@ async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> byt
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 _FEISHU_STALE_THREAD_CODE = 99992402  # thread_id create route rejected: the topic is gone/stale
 _STALE_THREAD_FALLBACK_NOTICE = "原话题已失效，回复转发至群聊"
+_THREAD_ANCHOR_CACHE_SIZE = 512
 
 # Feishu reactions render as prominent badges, unlike Discord/Telegram's
 # small footer emoji — a success badge on every message would add noise, so
@@ -1333,6 +1334,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._chat_locks: collections.OrderedDict[str, asyncio.Lock] = collections.OrderedDict()  # chat_id → lock (per-chat serial processing, LRU-bounded)
         self._chat_info_cache: dict[str, dict[str, Any]] = {}
         self._message_text_cache: OrderedDict[str, Optional[str]] = OrderedDict()
+        # thread_id → newest message this adapter saw in the topic (inbound or sent). A topic only
+        # accepts a post as a reply, and anchor-less sends (completion receipts, synthetic turns)
+        # would otherwise need the list API, which requires the im:message.group_msg scope.
+        self._thread_anchor_ids: OrderedDict[str, str] = OrderedDict()
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -2689,6 +2694,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # too, so using it as a fallback (#19711) turned ordinary quote replies into topic
         # sessions and pushed the bot's answer into a fresh thread (#20548).
         thread_id = getattr(message, "thread_id", None) or None
+        self._remember_thread_anchor(thread_id, message_id)
         reply_to_message_id = (
             getattr(message, "parent_id", None) or getattr(message, "upper_message_id", None)
             or getattr(message, "root_id", None) or None
@@ -3804,6 +3810,9 @@ class FeishuAdapter(BasePlatformAdapter):
         """Fetch the last message_id in a thread for reply-based routing."""
         if not self._client or not thread_id:
             return None
+        known = self._thread_anchor_ids.get(str(thread_id))
+        if known:
+            return known
         try:
             from lark_oapi.api.im.v1 import ListMessageRequest
             # Newest first: the default ascending order returns the topic's first message.
@@ -3814,6 +3823,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 items = getattr(getattr(response, "data", None), "items", None)
                 if items and len(items) > 0:
                     return getattr(items[0], "message_id", None)
+            else:
+                logger.info("[Feishu] Thread %s last-message lookup refused (code %s: %s)",
+                            thread_id, getattr(response, "code", None), getattr(response, "msg", None))
         except Exception as exc:
             logger.debug("[Feishu] Failed to fetch last message in thread %s: %s", thread_id, exc)
         return None
@@ -3828,7 +3840,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 content=payload, msg_type=msg_type, reply_in_thread=bool(thread_id), uuid_value=str(uuid.uuid4()),
             )
             request = self._build_reply_message_request(effective_reply_to, body)
-            return await self._run_blocking(self._client.im.v1.message.reply, request)
+            response = await self._run_blocking(self._client.im.v1.message.reply, request)
+            if thread_id:
+                self._remember_thread_anchor(thread_id, self._extract_response_field(response, "message_id"))
+            return response
         if thread_id:
             # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
             receive_id, receive_id_type = thread_id, "thread_id"
@@ -3840,7 +3855,18 @@ class FeishuAdapter(BasePlatformAdapter):
             receive_id=receive_id, msg_type=msg_type, content=payload, uuid_value=str(uuid.uuid4()),
         )
         request = self._build_create_message_request(receive_id_type, body)
-        return await self._run_blocking(self._client.im.v1.message.create, request)
+        response = await self._run_blocking(self._client.im.v1.message.create, request)
+        if thread_id:
+            self._remember_thread_anchor(thread_id, self._extract_response_field(response, "message_id"))
+        return response
+
+    def _remember_thread_anchor(self, thread_id: Optional[str], message_id: Optional[str]) -> None:
+        if not thread_id or not message_id:
+            return
+        self._thread_anchor_ids[str(thread_id)] = str(message_id)
+        self._thread_anchor_ids.move_to_end(str(thread_id))
+        while len(self._thread_anchor_ids) > _THREAD_ANCHOR_CACHE_SIZE:
+            self._thread_anchor_ids.popitem(last=False)
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:
